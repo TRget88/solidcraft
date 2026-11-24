@@ -12,10 +12,12 @@
 //! model's build counts (readers must ignore the others), and a part that can't be read fails
 //! only the placements that need it. Bodies are named after their objects; a slicer project whose
 //! objects have no name in the model names them in its settings (Bambu Studio's
-//! `Metadata/model_settings.config`), and those names are used. Packages are untrusted: sizes,
-//! entry counts, model parts, mesh sizes and component nesting are capped.
+//! `Metadata/model_settings.config`), and those names are used. Packages are untrusted, so sizes,
+//! entry counts, model parts, the objects, materials and placements they hold, mesh sizes and
+//! component nesting are capped, and file text quoted in a message is cut short.
 
 use solidcraft_geom::prelude::*;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read, Write};
@@ -34,6 +36,19 @@ const MAX_PART: u64 = 1 << 30;
 const MAX_ENTRIES: usize = 10_000;
 /// Most vertices or triangles in one file.
 const MAX_ELEMENTS: usize = 20_000_000;
+/// Most objects, base materials, components and build items read from all the model parts of a
+/// package. Each is kept until the meshes are built (a placement keeps its transform, about 150
+/// bytes, from as little as 20 bytes of XML, and a base material keeps 16 bytes from 7), so a
+/// package of under 1 MB holding tens of millions of bare build items asked for 5 to 15 GB before
+/// the placement budget ever ran (#21468). At this cap they keep about 150 to 250 MB, less than
+/// the vertex budget allows. Real packages hold thousands.
+const MAX_KEPT: usize = 1_000_000;
+/// Most build items that get a warning of their own. One more line counts the rest.
+const MAX_ITEM_WARNINGS: usize = 100;
+/// Most characters of file text (a name, a path, a value) quoted in a message. A message about a
+/// model part that can't be read is copied for every placement that needs the part, so it never
+/// holds file text of any length whole (#21468).
+const MAX_QUOTED: usize = 200;
 const MAX_COMPONENT_DEPTH: usize = 16;
 const MAX_XML_DEPTH: usize = 256;
 
@@ -552,6 +567,14 @@ fn bad<T>(msg: impl Into<String>) -> Result<T> {
     Err(IoError::Invalid(format!("3MF: {}", msg.into())))
 }
 
+/// File text `s` as a message quotes it, at most [`MAX_QUOTED`] characters with `...` after a cut.
+fn quoted(s: &str) -> Cow<'_, str> {
+    match s.char_indices().nth(MAX_QUOTED) {
+        Some((cut, _)) => Cow::Owned(format!("{}...", s.get(..cut).unwrap_or_default())),
+        None => Cow::Borrowed(s),
+    }
+}
+
 /// The name a part is looked up by: `%XX` escapes decoded, no leading `/`, in lower case (part
 /// names are URIs and compare case-insensitively).
 fn part_key(name: &str) -> String {
@@ -585,19 +608,19 @@ fn read_part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Opt
     };
     match read_entry(zip, idx, name, MAX_PART)? {
         Some(data) => Ok(Some(data)),
-        None => bad(format!("{name} expands to more than 1 GB")),
+        None => bad(format!("{} expands to more than 1 GB", quoted(name))),
     }
 }
 
 /// Entry `idx` uncompressed, or `None` when it expands to more than `limit` bytes (zip bombs stop
 /// there).
 fn read_entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, idx: usize, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
-    let mut f = zip.by_index(idx).map_err(|e| IoError::Invalid(format!("3MF {name}: {e}")))?;
+    let mut f = zip.by_index(idx).map_err(|e| IoError::Invalid(format!("3MF {}: {e}", quoted(name))))?;
     if f.size() > limit {
         return Ok(None);
     }
     let mut out = Vec::with_capacity(f.size().min(16 << 20) as usize);
-    (&mut f).take(limit.saturating_add(1)).read_to_end(&mut out).map_err(|e| IoError::Invalid(format!("3MF {name}: {e}")))?;
+    (&mut f).take(limit.saturating_add(1)).read_to_end(&mut out).map_err(|e| IoError::Invalid(format!("3MF {}: {e}", quoted(name))))?;
     Ok((out.len() as u64 <= limit).then_some(out))
 }
 
@@ -624,7 +647,7 @@ fn parse_xf(s: Option<&String>) -> Result<Xf> {
         .split_whitespace()
         .map(|t| t.parse::<f64>().ok().filter(|x| x.is_finite() && x.abs() < 1e12))
         .collect::<Option<_>>()
-        .ok_or_else(|| IoError::Invalid(format!("3MF: bad transform `{s}`")))?;
+        .ok_or_else(|| IoError::Invalid(format!("3MF: bad transform `{}`", quoted(s))))?;
     let mut m = IDENTITY;
     if v.len() != 12 {
         return bad(format!("transform with {} numbers", v.len()));
@@ -700,9 +723,9 @@ struct Package {
 }
 
 impl Package {
-    /// Part `key` as the package names it.
-    fn shown<'a>(&'a self, key: &'a str) -> &'a str {
-        self.names.get(key).map_or(key, String::as_str)
+    /// Part `key` as the package names it, [`quoted`].
+    fn shown<'a>(&'a self, key: &'a str) -> Cow<'a, str> {
+        quoted(self.names.get(key).map_or(key, String::as_str))
     }
 }
 
@@ -729,9 +752,21 @@ fn part_name(a: &HashMap<String, String>) -> Option<PartName> {
     a.get("path").map(|p| PartName { key: part_key(p), path: p.clone() })
 }
 
+/// Count one more object, base material (or group of them), component or build item read from the
+/// package, and refuse the package once there are more than [`MAX_KEPT`].
+fn count_kept(kept: &mut usize) -> Result<()> {
+    *kept = kept.saturating_add(1);
+    if *kept > MAX_KEPT {
+        return bad(format!("more than {MAX_KEPT} objects, base materials, components and build items"));
+    }
+    Ok(())
+}
+
 /// Model part `xml`. Only the `root` model's build items are read: the spec has readers ignore
 /// the build sections of the other parts (slicers leave them empty or point them anywhere).
-fn parse_model(xml: &[u8], root: bool) -> Result<Model> {
+/// `kept` counts the objects, base materials, components and build items read so far from every
+/// part of the package ([`count_kept`]).
+fn parse_model(xml: &[u8], root: bool, kept: &mut usize) -> Result<Model> {
     let mut rd = Reader::from_reader(xml);
     rd.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -743,7 +778,7 @@ fn parse_model(xml: &[u8], root: bool) -> Result<Model> {
     let mut elements = 0usize;
     let mut seen_model = false;
     loop {
-        let ev = rd.read_event_into(&mut buf).map_err(|e| IoError::Invalid(format!("3MF model XML: {e}")))?;
+        let ev = rd.read_event_into(&mut buf).map_err(|e| IoError::Invalid(format!("3MF model XML: {}", quoted(&e.to_string()))))?;
         let (e, empty) = match &ev {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
@@ -784,21 +819,24 @@ fn parse_model(xml: &[u8], root: bool) -> Result<Model> {
             b"model" => {
                 seen_model = true;
                 if let Some(u) = a.get("unit") {
-                    unit = unit_mm(u).ok_or_else(|| IoError::Invalid(format!("3MF: unknown unit `{u}`")))?;
+                    unit = unit_mm(u).ok_or_else(|| IoError::Invalid(format!("3MF: unknown unit `{}`", quoted(u))))?;
                 }
             }
             b"basematerials" => {
                 let gid = id("id").ok_or_else(|| IoError::Invalid("3MF: base materials without id".into()))?;
+                count_kept(kept)?;
                 m.materials.insert(gid, Vec::new());
                 cur_mat = if empty { None } else { Some(gid) };
             }
             b"base" => {
                 if let Some(g) = cur_mat.and_then(|g| m.materials.get_mut(&g)) {
+                    count_kept(kept)?;
                     g.push(a.get("displaycolor").and_then(|c| color(c)));
                 }
             }
             b"object" => {
                 let oid = id("id").ok_or_else(|| IoError::Invalid("3MF: object without id".into()))?;
+                count_kept(kept)?;
                 let o = Object {
                     name: a.get("name").cloned().unwrap_or_default(),
                     material: id("pid").map(|p| (p, a.get("pindex").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0))),
@@ -829,12 +867,14 @@ fn parse_model(xml: &[u8], root: bool) -> Result<Model> {
             b"component" => {
                 let Some((_, o)) = cur.as_mut() else { return bad("component outside an object") };
                 let target = id("objectid").ok_or_else(|| IoError::Invalid("3MF: component without objectid".into()))?;
+                count_kept(kept)?;
                 // The spec allows `p:path` only in the root model's components; a reader can still
                 // follow it from any part (loops and depth are checked when placing).
                 o.components.push(Ref { part: part_name(&a), id: target, xf: in_mm(parse_xf(a.get("transform"))?, unit) });
             }
             b"item" if root => {
                 let target = id("objectid").ok_or_else(|| IoError::Invalid("3MF: build item without objectid".into()))?;
+                count_kept(kept)?;
                 m.build.push(Ref { part: part_name(&a), id: target, xf: in_mm(parse_xf(a.get("transform"))?, unit) });
             }
             _ => {}
@@ -868,7 +908,7 @@ fn in_part(name: &str, e: IoError) -> String {
     match e {
         IoError::Invalid(msg) => {
             let msg = msg.strip_prefix("3MF: ").or_else(|| msg.strip_prefix("3MF ")).unwrap_or(&msg);
-            format!("3MF model part `{name}`: {msg}")
+            format!("3MF model part `{}`: {msg}", quoted(name))
         }
         e => e.to_string(),
     }
@@ -893,7 +933,7 @@ fn slicer_names(xml: &[u8]) -> std::result::Result<HashMap<u32, String>, String>
     // The object being read: its id (if it has a usable one) and the depth of its element.
     let mut object: Option<(Option<u32>, usize)> = None;
     loop {
-        let ev = rd.read_event_into(&mut buf).map_err(|e| e.to_string())?;
+        let ev = rd.read_event_into(&mut buf).map_err(|e| quoted(&e.to_string()).into_owned())?;
         let start = matches!(ev, Event::Start(_));
         match &ev {
             Event::Start(e) | Event::Empty(e) => {
@@ -1052,10 +1092,11 @@ pub fn read_3mf(bytes: &[u8]) -> Result<(Vec<MeshObject>, Vec<String>)> {
             buf.clear();
         }
     }
-    let xml = read_part(&mut zip, &root)?.ok_or_else(|| IoError::Invalid(format!("3MF: no model part `{root}`")))?;
+    let xml = read_part(&mut zip, &root)?.ok_or_else(|| IoError::Invalid(format!("3MF: no model part `{}`", quoted(&root))))?;
     let root_name = root;
     let root = part_key(&root_name);
-    let model = parse_model(&xml, true)?;
+    let mut kept = 0usize;
+    let model = parse_model(&xml, true, &mut kept)?;
     // All model parts together may expand to 1 GB; only one is held as XML at a time.
     let mut model_bytes = xml.len() as u64;
     drop(xml);
@@ -1080,7 +1121,7 @@ pub fn read_3mf(bytes: &[u8]) -> Result<(Vec<MeshObject>, Vec<String>)> {
         let read = match read_entry(&mut zip, idx, &name, MAX_PART.saturating_sub(model_bytes)) {
             Ok(Some(xml)) => {
                 model_bytes = model_bytes.saturating_add(xml.len() as u64);
-                parse_model(&xml, false)
+                parse_model(&xml, false, &mut kept)
             }
             // The package-wide caps refuse the whole package, not just this part.
             Ok(None) => return bad("model parts expand to more than 1 GB"),
@@ -1091,6 +1132,8 @@ pub fn read_3mf(bytes: &[u8]) -> Result<(Vec<MeshObject>, Vec<String>)> {
                 queue_parts(&m, &mut names, &mut pending)?;
                 parts.insert(key, m);
             }
+            // So does the count of what the parts keep, which every part draws on.
+            Err(e) if kept > MAX_KEPT => return Err(e),
             Err(e) => {
                 failed.insert(key, in_part(&name, e));
             }
@@ -1101,12 +1144,14 @@ pub fn read_3mf(bytes: &[u8]) -> Result<(Vec<MeshObject>, Vec<String>)> {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     let mut total = 0usize;
+    // Build items past the first MAX_ITEM_WARNINGS that gave no mesh, counted in one last line.
+    let mut unlisted = 0usize;
     // Bodies of root model objects without a name of their own: (index in `out`, object id).
     let mut unnamed = Vec::new();
     for (k, item) in model.build.iter().enumerate() {
         let part = item.part.as_ref().map_or(pkg.root.as_str(), |p| p.key.as_str());
         let mut mo = MeshObject::default();
-        match flatten(&pkg, part, item.id, &item.xf, &mut mo, &mut Vec::new(), &mut total) {
+        let warning = match flatten(&pkg, part, item.id, &item.xf, &mut mo, &mut Vec::new(), &mut total) {
             Ok(()) if !mo.triangles.is_empty() => {
                 let name = pkg.parts.get(part).and_then(|m| m.objects.get(&item.id)).map(|o| o.name.trim().to_string()).filter(|n| !n.is_empty());
                 if name.is_none() && part == pkg.root {
@@ -1114,10 +1159,26 @@ pub fn read_3mf(bytes: &[u8]) -> Result<(Vec<MeshObject>, Vec<String>)> {
                 }
                 mo.name = name.unwrap_or_else(|| format!("Mesh{}", k + 1));
                 out.push(mo);
+                continue;
             }
-            Ok(()) => warnings.push(format!("build item {} has no triangles", k + 1)),
-            Err(e) => warnings.push(format!("build item {}: {e}", k + 1)),
+            Ok(()) => format!("build item {} has no triangles", k + 1),
+            // Once the budget is spent every later build item goes over it as well, so the build
+            // stops here with one warning for all of them.
+            Err(e) if total > MAX_ELEMENTS => {
+                let last = model.build.len();
+                warnings.push(if k + 1 < last { format!("build items {} to {last}: {e}", k + 1) } else { format!("build item {}: {e}", k + 1) });
+                break;
+            }
+            Err(e) => format!("build item {}: {e}", k + 1),
+        };
+        if warnings.len() < MAX_ITEM_WARNINGS {
+            warnings.push(warning);
+        } else {
+            unlisted += 1;
         }
+    }
+    if unlisted > 0 {
+        warnings.push(format!("{unlisted} more build items have no triangles or could not be read"));
     }
     // A slicer project names its objects in its settings (#3858). Those are read only when a body
     // needs a name, within what the model parts left of the budget, and settings that can't be
@@ -1814,6 +1875,150 @@ pub(crate) mod tests {
         let (objs, warnings) = read_3mf(&package(&model, None)).unwrap();
         assert!(objs.len() < 4_000, "the shared budget must stop the later items: {} built", objs.len());
         assert!(warnings.iter().any(|w| w.contains("too many triangles")), "{warnings:?}");
+    }
+
+    /// Every object, base material, component and build item read is kept until the meshes are
+    /// built, so each is counted against one budget for the whole package as it is read (#21468).
+    /// Each kind fills the budget to the last unit, one more is refused, and the build items of
+    /// parts other than the root, which are ignored, cost nothing.
+    #[test]
+    fn objects_materials_components_and_build_items_are_counted_as_they_are_read() {
+        let model = |inner: &str| format!(r#"<model unit="millimeter" xmlns="{CORE_NS}">{inner}</model>"#);
+        let three = [
+            ("objects", model(r#"<resources><object id="1"/><object id="2"></object><object id="3"/></resources>"#)),
+            (
+                "base materials",
+                model(
+                    r##"<resources><basematerials id="1"><base name="Red" displaycolor="#FF0000"/><base name="Blue"/></basematerials></resources>"##,
+                ),
+            ),
+            (
+                "components",
+                model(
+                    r#"<resources><object id="1"><components><component objectid="2"/><component objectid="2"/></components></object></resources>"#,
+                ),
+            ),
+            ("build items", model(r#"<build><item objectid="1"/><item objectid="1"/><item objectid="1"/></build>"#)),
+        ];
+        for (what, xml) in &three {
+            let mut kept = MAX_KEPT - 3;
+            assert!(parse_model(xml.as_bytes(), true, &mut kept).is_ok(), "{what}");
+            assert_eq!(kept, MAX_KEPT, "{what}");
+            let mut kept = MAX_KEPT - 2;
+            let err = parse_model(xml.as_bytes(), true, &mut kept).map(|_| ()).unwrap_err().to_string();
+            assert!(err.contains("more than 1000000 objects, base materials, components and build items"), "{what}: {err}");
+        }
+        let mut kept = MAX_KEPT;
+        assert!(parse_model(three[3].1.as_bytes(), false, &mut kept).is_ok());
+    }
+
+    /// The package from the audit of the importers (#21468), one build item over the budget. It
+    /// holds only bare build items naming an object it doesn't have. The reader used to keep every
+    /// item (about 150 bytes each) and then write a warning for each, so 34 million of them, under
+    /// 1 MB compressed, asked for 5 to 15 GB and could abort the app. Now it refuses the package
+    /// once the count passes the budget.
+    #[test]
+    fn a_package_of_more_build_items_than_the_budget_is_refused() {
+        let items = r#"<item objectid="1"/>"#.repeat(MAX_KEPT + 1);
+        let model = format!(r#"<model unit="millimeter" xmlns="{CORE_NS}"><build>{items}</build></model>"#);
+        let err = read_3mf(&package(&model, None)).map(|_| ()).unwrap_err().to_string();
+        assert_eq!(err, "3MF: more than 1000000 objects, base materials, components and build items");
+        // Spread over two model parts, the count is the package's, and the package is refused, not
+        // just the part that went over. Each part holds half the budget in placements (build items
+        // in the root, components in the other), and the two objects and the root's one component
+        // take it over.
+        let half = MAX_KEPT / 2;
+        let objects = model_part(
+            "millimeter",
+            &format!(r#"<object id="1" type="model"><components>{}</components></object>"#, r#"<component objectid="2"/>"#.repeat(half)),
+        );
+        let path = format!("/{OBJECTS_PART}");
+        let root = root_model(&assembly(9, &[(path.as_str(), 1)]), &r#"<item objectid="9"/>"#.repeat(half));
+        let err = read_3mf(&package_parts(&[("3D/3dmodel.model", &root), (OBJECTS_PART, &objects)])).map(|_| ()).unwrap_err().to_string();
+        assert_eq!(err, "3MF: more than 1000000 objects, base materials, components and build items");
+    }
+
+    /// Once the placement budget is spent every later build item goes over it too, so the build
+    /// stops at the first one with one warning for it and the rest, not one per item.
+    #[test]
+    fn a_spent_placement_budget_ends_the_build_with_one_warning() {
+        let fan = |id: u32, child: u32| assembly(id, &vec![("", child); 300]);
+        let objects = format!(r#"<object id="1" type="model"/>{}{}{}{}"#, fan(2, 1), fan(3, 2), fan(4, 3), tet_object(5, "Tet", 1.0));
+        let items = r#"<item objectid="5"/><item objectid="4"/><item objectid="5"/><item objectid="5"/>"#;
+        let (objs, warnings) = read_3mf(&package(&root_model(&objects, items), None)).unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(warnings, ["build items 2 to 4: 3MF: too many triangles or placements after placing components"]);
+    }
+
+    /// Build items that give no mesh get a warning each, up to a hundred, and one more line counts
+    /// the rest, so a package of a million broken items doesn't make a million warnings.
+    #[test]
+    fn warnings_for_build_items_without_a_mesh_stop_at_a_hundred() {
+        let items = format!(r#"<item objectid="1"/>{}"#, r#"<item objectid="9"/>"#.repeat(150));
+        let (objs, warnings) = read_3mf(&package(&root_model(&tet_object(1, "Tet", 1.0), &items), None)).unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(warnings.len(), MAX_ITEM_WARNINGS + 1, "{warnings:?}");
+        assert_eq!(warnings[0], "build item 2: 3MF: missing object 9");
+        assert_eq!(warnings[MAX_ITEM_WARNINGS - 1], "build item 101: 3MF: missing object 9");
+        assert_eq!(warnings[MAX_ITEM_WARNINGS], "50 more build items have no triangles or could not be read");
+    }
+
+    /// File text quoted in a message is cut to [`MAX_QUOTED`] characters. The message about a model
+    /// part that is missing or can't be read is copied for every build item that needs the part,
+    /// so a long path or value placed many times filled memory with copies of it (#21468).
+    #[test]
+    fn long_file_text_is_cut_short_in_messages() {
+        assert_eq!(quoted(&"é".repeat(MAX_QUOTED)), "é".repeat(MAX_QUOTED));
+        assert_eq!(quoted(&"é".repeat(MAX_QUOTED + 1)), format!("{}...", "é".repeat(MAX_QUOTED)));
+        let long = "a".repeat(10_000);
+        let cut = format!("{}...", &long[..MAX_QUOTED]);
+        let err = read_3mf(&package(&format!(r#"<model unit="{long}" xmlns="{CORE_NS}"/>"#), None)).map(|_| ()).unwrap_err().to_string();
+        assert_eq!(err, format!("3MF: unknown unit `{cut}`"));
+        // Build item 2 needs a part the package doesn't have, and build item 3 one in an unknown unit.
+        let missing = format!("/{long}.model");
+        let part = format!("/{OBJECTS_PART}");
+        let objects = format!("{}{}{}", tet_object(1, "Tet", 1.0), assembly(2, &[(missing.as_str(), 1)]), assembly(3, &[(part.as_str(), 1)]));
+        let root = root_model(&objects, r#"<item objectid="1"/><item objectid="2"/><item objectid="3"/>"#);
+        let bytes = package_parts(&[("3D/3dmodel.model", &root), (OBJECTS_PART, &model_part(&long, &tet_object(1, "Far", 1.0)))]);
+        let (objs, warnings) = read_3mf(&bytes).unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(
+            warnings,
+            [
+                format!("build item 2: 3MF: no model part `{}...`", &missing[..MAX_QUOTED]),
+                format!("build item 3: 3MF model part `{part}`: unknown unit `{cut}`"),
+            ]
+        );
+    }
+
+    /// A package with several build items and an object made of components, as our writer and
+    /// other programs write it, comes in as the same meshes, so counting what is read changes
+    /// nothing for a real package. Each build item is one body, and the object made of
+    /// components is one body with all of their triangles, in order.
+    #[test]
+    fn several_build_items_and_components_come_in_as_the_same_meshes() {
+        let shifted = |name: &str, by: Vec3| {
+            let mut t = tetra(name);
+            t.positions.iter_mut().for_each(|p| *p += by);
+            t
+        };
+        let objects = [
+            tetra("Cube"),
+            shifted("Dome", Vec3::new(20.0, 0.0, 0.0)),
+            shifted("Loose", Vec3::new(0.0, 30.0, 0.0)),
+            shifted("Pin", Vec3::new(0.0, 0.0, 40.0)),
+        ];
+        let bytes = write_3mf_parts(&objects, &[("Bracket".into(), vec![0, 1])], &[], None).unwrap();
+        let (read, warnings) = read_3mf(&bytes).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let names: Vec<&str> = read.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Loose", "Pin", "Bracket"]);
+        for (got, want) in read.iter().zip([&objects[2], &objects[3]]) {
+            assert_eq!((&got.positions, &got.triangles), (&want.positions, &want.triangles), "{}", want.name);
+        }
+        let positions: Vec<Vec3> = objects[0].positions.iter().chain(&objects[1].positions).copied().collect();
+        let triangles: Vec<[u32; 3]> = objects[0].triangles.iter().copied().chain(objects[1].triangles.iter().map(|t| t.map(|v| v + 4))).collect();
+        assert_eq!((&read[2].positions, &read[2].triangles), (&positions, &triangles));
     }
 
     /// [`weld_tagged`] as it was before the open-side vertices were binned on a grid: every open
