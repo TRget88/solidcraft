@@ -462,3 +462,174 @@ fn hostile_gltf_never_panics() {
         assert!(read(junk).is_err());
     }
 }
+
+/// A node that lists itself 64 times (#21468). Comparing its subtree for instancing used to follow
+/// every path eight levels down, 64^8 of them, so the import never finished. Now it ends as the
+/// walk always meant it to. The root is the import's own component with its mesh baked in, the
+/// first child is the component "Cube" (named after its mesh) with the mesh again, the loop back
+/// inside it is not followed, and the other 63 children are more occurrences of that component.
+#[test]
+fn a_node_listing_itself_many_times_is_read_once_and_its_loop_cut() {
+    let mut f = Fixture::default();
+    let m = f.cube_mesh("Cube", 0.01);
+    let n = f.node(json!({"mesh": m, "children": vec![0; 64]}));
+    f.roots = vec![n];
+    let g = read(&f.glb()).unwrap();
+    assert_eq!(g.plan.slots, vec!["Cube"]);
+    assert_eq!(g.plan.places.len(), 64);
+    assert!(g.plan.places.iter().all(|p| p.slot == 0 && p.parent.is_none()));
+    assert_eq!(g.plan.bodies, vec![None, Some(0)]);
+    assert!(plan_ok(&g.plan));
+    assert!(g.feature.warnings.iter().any(|w| w.contains("too large or too deep")), "{:?}", g.feature.warnings);
+}
+
+/// Nodes 0 to 7 each list the next node 64 times and node 8 holds the mesh (#21468). Comparing
+/// subtrees followed all 64^7 paths below node 1, so the import never finished. Now the comparison
+/// stops at its budget and the import ends as the walk meant it to. Each level is one component
+/// (named after the node, or the mesh for the last), placed 64 times in the level above, and the
+/// root is the import's own.
+#[test]
+fn nodes_listing_the_same_child_many_times_over_many_levels_are_read_quickly() {
+    let mut f = Fixture::default();
+    let m = f.cube_mesh("Cube", 0.01);
+    for k in 0..8 {
+        f.node(json!({"children": vec![k + 1; 64]}));
+    }
+    f.node(json!({"mesh": m}));
+    f.roots = vec![0];
+    let g = read(&f.glb()).unwrap();
+    assert!(g.feature.warnings.is_empty(), "{:?}", g.feature.warnings);
+    let names: Vec<String> = (1..8).map(|k| format!("Node {k}")).chain(["Cube".to_string()]).collect();
+    assert_eq!(g.plan.slots, names);
+    assert_eq!(g.plan.places.len(), 8 * 64);
+    for (level, places) in g.plan.places.chunk_by(|a, b| a.slot == b.slot).enumerate().take(8) {
+        // Each level's first placement makes its component, which the next level fills.
+        assert_eq!(places[0].slot, level, "{places:?}");
+        assert_eq!(places[0].parent, level.checked_sub(1), "{places:?}");
+    }
+    assert!(g.plan.places.iter().all(|p| p.parent == p.slot.checked_sub(1)));
+    assert_eq!(g.plan.bodies, vec![Some(7)]);
+    assert!(plan_ok(&g.plan));
+}
+
+/// A node with a million children that hold no mesh, and one child with a mesh, listed 100,000 times
+/// (#21468). The node sits 2,000 km out, too far to be a component of its own, so it is read again
+/// each time it is listed, and the walk passed over all million each time, 33,000 times before the
+/// placement cap stopped it. A file whose nodes form a tree passes over each child entry once, so
+/// now the walk stops once it has passed over more than the file lists (and the 100,000 placements'
+/// worth on top). That is partway through the second time. The child with the mesh, placed back at
+/// the origin, became the component "Cube" the first time and is not reached again.
+#[test]
+fn a_node_with_many_empty_children_read_again_and_again_is_cut_off() {
+    let mut f = Fixture::default();
+    let m = f.cube_mesh("Cube", 0.01);
+    let mut children = vec![2; 1_000_000];
+    children.push(3);
+    f.node(json!({"children": vec![1; 100_000]}));
+    f.node(json!({"translation": [2.0e6, 0.0, 0.0], "children": children}));
+    f.node(json!({}));
+    f.node(json!({"mesh": m, "translation": [-2.0e6, 0.0, 0.0]}));
+    f.roots = vec![0];
+    let g = read(&f.glb()).unwrap();
+    assert_eq!(g.plan.slots, vec!["Cube"]);
+    assert_eq!(g.plan.places.len(), 1);
+    assert!(g.plan.places[0].transform[3].iter().take(3).all(|v| v.abs() < 1e-6), "{:?}", g.plan.places[0]);
+    assert_eq!(g.plan.bodies, vec![Some(0)]);
+    assert!(g.feature.warnings.iter().any(|w| w.contains("too large or too deep")), "{:?}", g.feature.warnings);
+}
+
+/// The glTF reader builds every list in the JSON in full before anything can look at it, about
+/// 220 bytes for each `{}` node (#21468). Files holding more objects or values than the caps are
+/// refused before it starts, as a .gltf and as a .glb.
+#[test]
+fn a_file_holding_too_many_objects_or_values_is_refused_before_it_is_read() {
+    let list = |item: &str, n: usize| {
+        let mut s = format!("{item},").repeat(n);
+        s.pop();
+        s
+    };
+    let nodes = format!("{{\"asset\":{{\"version\":\"2.0\"}},\"nodes\":[{}]}}", list("{}", MAX_JSON_OBJECTS));
+    let too_many = format!("more than {MAX_JSON_OBJECTS} objects");
+    let e = read_gltf(nodes.as_bytes(), "nodes.gltf", &mut no_files).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains(&too_many), "{e}");
+    let e = read(&glb_container(nodes.as_bytes(), &[])).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains(&too_many), "{e}");
+    // Numbers cost less each, but an accessor's bounds become a general JSON value of 32 bytes per
+    // number.
+    let bounds = format!(
+        "{{\"asset\":{{\"version\":\"2.0\"}},\"accessors\":[{{\"componentType\":5126,\"count\":1,\"type\":\"SCALAR\",\"min\":[{}]}}]}}",
+        list("0", MAX_JSON_VALUES)
+    );
+    let e = read_gltf(bounds.as_bytes(), "bounds.gltf", &mut no_files).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains(&format!("more than {MAX_JSON_VALUES} values")), "{e}");
+    // The count is exact for a well-formed document. Brackets, commas, colons and escaped quotes in
+    // strings count for nothing, and nor do empty lists. Here 3 objects, 4 members and 5 list entries.
+    let c = Census::of(br#"{"a": [1, "x,:]\"[", {"b": []}, [[]]], "c": {}, "d": "{["}"#);
+    assert_eq!((c.objects, c.values), (3, 9));
+    // Below the caps, a file is read as before, here up to finding no mesh.
+    let few = "{\"asset\":{\"version\":\"2.0\"},\"nodes\":[{},{},{}]}";
+    let e = read_gltf(few.as_bytes(), "few.gltf", &mut no_files).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("no triangle meshes"), "{e}");
+}
+
+/// A file laid out as exporters write assemblies, with nested nodes and the same meshes under many
+/// of them. Nodes whose subtrees match (the same meshes, placed the same way, at any depth below)
+/// are one component placed again, and a difference two levels down keeps them apart, as before
+/// the comparison had a budget.
+#[test]
+fn nested_nodes_and_reused_meshes_share_components_as_before() {
+    let mut f = Fixture::default();
+    let body = f.cube_mesh("Body", 0.1);
+    let hub = f.cube_mesh("Hub", 0.02);
+    let bolt = f.cube_mesh("Bolt", 0.005);
+    let wheel = |f: &mut Fixture, name: &str, x: f32| {
+        let bolts: Vec<usize> = (0..4)
+            .map(|k| {
+                f.node(json!({"name": format!("{name} bolt {k}"), "mesh": bolt, "translation": [0.01 * (k % 2) as f32, 0.01 * (k / 2) as f32, 0.02]}))
+            })
+            .collect();
+        f.node(json!({"name": name, "mesh": hub, "translation": [x, 0.0, 0.0], "children": bolts}))
+    };
+    let fl = wheel(&mut f, "Wheel FL", -0.1);
+    let fr = wheel(&mut f, "Wheel FR", 0.1);
+    let rl = wheel(&mut f, "Wheel RL", -0.1);
+    let rr = wheel(&mut f, "Wheel RR", 0.1);
+    let front = f.node(json!({"name": "Front axle", "translation": [0.0, 0.2, 0.0], "children": [fl, fr]}));
+    let rear = f.node(json!({"name": "Rear axle", "translation": [0.0, -0.2, 0.0], "children": [rl, rr]}));
+    let car = f.node(json!({"name": "Car", "mesh": body, "children": [front, rear]}));
+    f.roots = vec![car];
+    let g = read(&f.glb()).unwrap();
+    assert!(g.feature.warnings.is_empty(), "{:?}", g.feature.warnings);
+    // The car is the import's own component. The wheels match, so the first one's component is
+    // named after its mesh once another wheel is placed, and likewise the bolts. The rear axle
+    // matches the front one and keeps the first one's name, having no mesh to go by.
+    assert_eq!(g.plan.slots, vec!["Front axle", "Hub", "Bolt"]);
+    let at = |p: &PlanPlace| [p.transform[3][0], p.transform[3][1], p.transform[3][2]];
+    let expected: [(usize, Option<usize>, [f64; 3]); 8] = [
+        (0, None, [0.0, 200.0, 0.0]),
+        (1, Some(0), [-100.0, 0.0, 0.0]),
+        (2, Some(1), [0.0, 0.0, 20.0]),
+        (2, Some(1), [10.0, 0.0, 20.0]),
+        (2, Some(1), [0.0, 10.0, 20.0]),
+        (2, Some(1), [10.0, 10.0, 20.0]),
+        (1, Some(0), [100.0, 0.0, 0.0]),
+        (0, None, [0.0, -200.0, 0.0]),
+    ];
+    assert_eq!(g.plan.places.len(), expected.len());
+    for (p, (slot, parent, t)) in g.plan.places.iter().zip(expected) {
+        assert_eq!((p.slot, p.parent), (slot, parent), "{p:?}");
+        assert!(at(p).iter().zip(t).all(|(a, b)| close(*a, b)), "{p:?}");
+    }
+    assert_eq!(meshes(&g).iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Body", "Hub", "Bolt"]);
+    assert_eq!(g.plan.bodies, vec![None, Some(1), Some(2)]);
+    // With one bolt of the rear right wheel moved, that wheel and so the rear axle are parts of
+    // their own. The other rear wheel and every bolt are still the front ones.
+    let moved = f.nodes[rr]["children"][3].as_u64().unwrap() as usize;
+    f.nodes[moved]["translation"] = json!([0.012, 0.01, 0.02]);
+    let g = read(&f.glb()).unwrap();
+    assert_eq!(g.plan.slots, vec!["Front axle", "Hub", "Bolt", "Rear axle", "Wheel RR"]);
+    let rear_places: Vec<(usize, Option<usize>)> = g.plan.places.iter().skip(7).map(|p| (p.slot, p.parent)).collect();
+    assert_eq!(rear_places, [(3, None), (1, Some(3)), (4, Some(3)), (2, Some(4)), (2, Some(4)), (2, Some(4)), (2, Some(4))]);
+    assert_eq!(g.plan.bodies, vec![None, Some(1), Some(2), Some(4)]);
+    assert!(plan_ok(&g.plan));
+}

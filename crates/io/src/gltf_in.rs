@@ -42,6 +42,21 @@ const MAX_COMPONENT_DEPTH: usize = 32;
 const MAX_DEPTH: usize = 64;
 /// Most components one file makes.
 const MAX_COMPONENTS: usize = 5_000;
+/// Most JSON objects one file may hold (its nodes, meshes, accessors and materials, and the
+/// objects inside them). The glTF reader builds each into a structure of up to about 250 bytes, so
+/// a file of empty `{}` nodes grows about 75 times as it is read. At this cap that peaks below
+/// 700 MB, for twenty times the placements the walk below follows.
+const MAX_JSON_OBJECTS: usize = 1 << 21;
+/// Most JSON values (list entries and object members) one file may hold. The costliest, the
+/// numbers of an accessor's bounds, take 32 bytes each once read.
+const MAX_JSON_VALUES: usize = 1 << 24;
+/// How many levels below a node its subtree is compared with another's for instancing. Deeper
+/// down, a node is the same only as itself.
+const KEY_DEPTH: usize = 8;
+/// Most child entries read while comparing subtrees, in all, a second or two of work. A file whose
+/// nodes form a tree, as glTF asks, reads each entry at most once per level compared, so a tree of
+/// up to a quarter of a million child entries is always compared in full.
+const MAX_KEY_STEPS: usize = 1 << 21;
 /// Millimetres in a metre.
 const MM: f64 = 1000.0;
 
@@ -148,6 +163,11 @@ pub fn read_gltf(bytes: &[u8], file: &str, load: Loader<'_>) -> Result<GltfImpor
         .map(|s| s.to_string_lossy().trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Mesh".into());
+    // A file whose nodes form a tree, as glTF asks, reads each child entry once on the walk and at
+    // most once per level compared when telling components apart. A file that lists nodes again
+    // (shared or looping) gets as many entries again as the placement cap on top, and no more.
+    let child_entries: usize = doc.nodes().map(|n| n.children().len()).sum();
+    let entries = child_entries.saturating_add(MAX_PLACEMENTS);
     let mut reader = Reader {
         doc: &doc,
         buffers: Buffers { blob, data: HashMap::new(), total: 0, load },
@@ -155,10 +175,15 @@ pub fn read_gltf(bytes: &[u8], file: &str, load: Loader<'_>) -> Result<GltfImpor
         looks: Vec::new(),
         plan: MeshPlan::default(),
         keys: HashMap::new(),
+        keys_of: HashMap::new(),
+        key_steps: 0,
+        key_budget: entries.saturating_mul(KEY_DEPTH).min(MAX_KEY_STEPS),
         has_mesh: HashMap::new(),
         open: Vec::new(),
         slot_meshes: Vec::new(),
         placements: 0,
+        passed_over: 0,
+        pass_budget: entries,
         vertices: 0,
         triangles: 0,
         skipped: Vec::new(),
@@ -247,9 +272,95 @@ fn split_glb(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>)> {
 /// geometry reads without them.
 const LOOK_EXTENSIONS: [&str; 5] = ["KHR_texture_transform", "KHR_texture_basisu", "EXT_texture_webp", "MSFT_texture_dds", "KHR_materials_unlit"];
 
+/// How many JSON objects and values (list entries and object members) a document holds.
+#[derive(Default)]
+struct Census {
+    objects: usize,
+    values: usize,
+}
+
+impl Census {
+    /// Counts the document's objects and values from its bytes, building nothing and reading no
+    /// number, and stops once past a cap. A well-formed document is counted exactly, and the
+    /// reader refuses any other anyway.
+    fn of(json: &[u8]) -> Self {
+        let mut c = Census::default();
+        // The lists (`true`) and objects open around the current byte, each with whether it holds
+        // anything yet.
+        let mut open: Vec<(bool, bool)> = Vec::new();
+        let (mut in_string, mut escaped) = (false, false);
+        for &b in json {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            // Anything but its end starts or continues an entry of the list around it.
+            if let Some((true, holds)) = open.last_mut()
+                && b != b']'
+            {
+                *holds = true;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => {
+                    c.objects += usize::from(b == b'{');
+                    // The reader refuses nesting deeper than 128, so the count can stop there.
+                    if open.len() > 128 {
+                        break;
+                    }
+                    open.push((b == b'[', false));
+                }
+                b':' => c.values += 1,
+                b',' if matches!(open.last(), Some((true, _))) => c.values += 1,
+                b']' | b'}' => {
+                    if let Some((true, true)) = open.pop() {
+                        c.values += 1;
+                    }
+                }
+                _ => {}
+            }
+            if c.over() {
+                break;
+            }
+        }
+        c
+    }
+
+    fn over(&self) -> bool {
+        self.objects > MAX_JSON_OBJECTS || self.values > MAX_JSON_VALUES
+    }
+
+    /// Why the document is too large to read, once it is.
+    fn refusal(&self) -> Option<String> {
+        if self.objects > MAX_JSON_OBJECTS {
+            Some(format!(
+                "the glTF file holds more than {MAX_JSON_OBJECTS} objects (nodes, meshes, accessors and the like), more than can be imported"
+            ))
+        } else if self.values > MAX_JSON_VALUES {
+            Some(format!("the glTF file holds more than {MAX_JSON_VALUES} values, more than can be imported"))
+        } else {
+            None
+        }
+    }
+}
+
 /// The checked glTF document.
 fn parse_document(json: &[u8]) -> Result<gltf::Document> {
     let parsed = solidcraft_kernel::guard("glTF", || {
+        // The glTF reader builds every list in the file in full before anything can look at it, so
+        // the objects and values are counted first (#21468).
+        if let Some(too_large) = Census::of(json).refusal() {
+            return Ok(Err(too_large));
+        }
         let mut root: gltf::json::Root = match gltf::json::deserialize::from_slice(json) {
             Ok(r) => r,
             Err(e) => return Ok(Err(format!("not a glTF file: {e}"))),
@@ -507,12 +618,20 @@ struct Reader<'d, 'a, 'l> {
     plan: MeshPlan,
     /// Instance keys of the components made, to their slots.
     keys: HashMap<u64, usize>,
+    /// Each placed node's instance key, by node and leftover transform (bit for bit).
+    keys_of: HashMap<(usize, [[u64; 4]; 4]), u64>,
+    /// Child entries read so far to tell components apart, and the most allowed.
+    key_steps: usize,
+    key_budget: usize,
     has_mesh: HashMap<usize, bool>,
     /// Each component's mesh's name.
     slot_meshes: Vec<Option<String>>,
     /// The components being filled (the current node's ancestors).
     open: Vec<usize>,
     placements: usize,
+    /// Children passed over on the walk (no mesh below them) so far, and the most allowed.
+    passed_over: usize,
+    pass_budget: usize,
     vertices: usize,
     triangles: usize,
     /// What was left out, and why.
@@ -537,10 +656,9 @@ impl<'d> Reader<'d, '_, '_> {
         // In progress: a loop back here adds nothing.
         self.has_mesh.insert(index, false);
         let Some(node) = self.node(index) else { return false };
-        let children: Vec<usize> = node.children().map(|c| c.index()).collect();
         let mut any = node.mesh().is_some();
-        for c in children {
-            any |= self.subtree_has_mesh(c, depth + 1);
+        for child in node.children() {
+            any |= self.subtree_has_mesh(child.index(), depth + 1);
         }
         self.has_mesh.insert(index, any);
         any
@@ -555,10 +673,25 @@ impl<'d> Reader<'d, '_, '_> {
         true
     }
 
+    /// Whether the walk has used up its placements, or the children it may pass over. Nothing
+    /// more is placed after that, so it stops.
+    fn spent(&self) -> bool {
+        self.placements > MAX_PLACEMENTS || self.passed_over > self.pass_budget
+    }
+
+    /// A child with no mesh below it, passed over. Passing over more than the budget cuts the
+    /// node tree off.
+    fn pass_over(&mut self) {
+        self.passed_over += 1;
+        if self.passed_over > self.pass_budget {
+            self.cut_off = true;
+        }
+    }
+
     /// Node `index` under component `parent` (`None`: the import's own), whose frame sees the
     /// node's parent through `outer` (the parent's leftover scale, with the units).
     fn walk(&mut self, index: usize, parent: Option<usize>, outer: &Mat, depth: usize) -> Result<()> {
-        if !self.subtree_has_mesh(index, 0) || !self.budget(depth) {
+        if self.spent() || !self.subtree_has_mesh(index, 0) || !self.budget(depth) {
             return Ok(());
         }
         let Some(node) = self.node(index) else { return Ok(()) };
@@ -568,7 +701,7 @@ impl<'d> Reader<'d, '_, '_> {
             // No component of its own: built where its parent is.
             return self.walk_flat(index, parent, &local, depth);
         };
-        let key = self.key(index, &rest, 0);
+        let key = self.instance_key(index, &rest);
         if let Some(&slot) = self.keys.get(&key) {
             if self.open.contains(&slot) {
                 // A node inside itself (the file's tree loops): not followed.
@@ -594,10 +727,17 @@ impl<'d> Reader<'d, '_, '_> {
         self.plan.places.push(PlanPlace { slot, parent, transform: place, name: None });
         self.keys.insert(key, slot);
         self.node_meshes(index, Some(slot), &rest)?;
-        let children: Vec<usize> = node.children().map(|c| c.index()).collect();
         self.open.push(slot);
-        for c in children {
-            self.walk(c, Some(slot), &rest, depth + 1)?;
+        for child in node.children() {
+            if self.spent() {
+                break;
+            }
+            let c = child.index();
+            if self.subtree_has_mesh(c, 0) {
+                self.walk(c, Some(slot), &rest, depth + 1)?;
+            } else {
+                self.pass_over();
+            }
         }
         self.open.pop();
         Ok(())
@@ -606,17 +746,21 @@ impl<'d> Reader<'d, '_, '_> {
     /// Node `index` built in component `parent`, `local` being its whole placement there (scale
     /// and all): its meshes are baked with it.
     fn walk_flat(&mut self, index: usize, parent: Option<usize>, local: &Mat, depth: usize) -> Result<()> {
-        if !self.subtree_has_mesh(index, 0) || !self.budget(depth) {
+        if self.spent() || !self.subtree_has_mesh(index, 0) || !self.budget(depth) {
             return Ok(());
         }
         let Some(node) = self.node(index) else { return Ok(()) };
         self.node_meshes(index, parent, local)?;
-        let children: Vec<usize> = node.children().map(|c| c.index()).collect();
-        for c in children {
-            if depth + 1 < MAX_COMPONENT_DEPTH && self.plan.slots.len() < MAX_COMPONENTS {
+        for child in node.children() {
+            if self.spent() {
+                break;
+            }
+            let c = child.index();
+            if !self.subtree_has_mesh(c, 0) {
+                self.pass_over();
+            } else if depth + 1 < MAX_COMPONENT_DEPTH && self.plan.slots.len() < MAX_COMPONENTS {
                 self.walk(c, parent, local, depth + 1)?;
             } else {
-                let Some(child) = self.node(c) else { continue };
                 let m = mat_mul(local, &node_matrix(&child));
                 self.walk_flat(c, parent, &m, depth + 1)?;
             }
@@ -624,20 +768,39 @@ impl<'d> Reader<'d, '_, '_> {
         Ok(())
     }
 
-    /// What makes two placements the same component: the node's mesh, how it is baked, and the
-    /// same children placed the same way below it.
+    /// The instance key of node `index` with leftover transform `rest` (see [`Self::key`]), worked
+    /// out once for each node and transform. A node placed again, or inside itself, gets the same
+    /// key at no cost, and keeps it once the budget for telling components apart is spent.
+    fn instance_key(&mut self, index: usize, rest: &Mat) -> u64 {
+        let at = (index, rest.map(|c| c.map(f64::to_bits)));
+        if let Some(&key) = self.keys_of.get(&at) {
+            return key;
+        }
+        let key = self.key(index, rest, 0);
+        self.keys_of.insert(at, key);
+        key
+    }
+
+    /// What makes two placements the same component. That is the node's mesh, how it is baked,
+    /// and the same children placed the same way below it, to [`KEY_DEPTH`] levels. Each child
+    /// entry read is a step of the file's budget.
     fn key(&mut self, index: usize, rest: &Mat, depth: usize) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let Some(node) = self.node(index) else { return 0 };
         node.mesh().map(|m| m.index()).hash(&mut h);
         hash_mat(rest, &mut h);
-        if depth < 8 {
-            let children: Vec<usize> = node.children().map(|c| c.index()).collect();
-            for c in children {
+        let mut whole = depth < KEY_DEPTH;
+        if whole {
+            for child in node.children() {
+                if self.key_steps >= self.key_budget {
+                    whole = false;
+                    break;
+                }
+                self.key_steps += 1;
+                let c = child.index();
                 if !self.subtree_has_mesh(c, 0) {
                     continue;
                 }
-                let Some(child) = self.node(c) else { continue };
                 let local = mat_mul(rest, &node_matrix(&child));
                 match split_rigid(&local) {
                     Some((place, child_rest)) => {
@@ -647,8 +810,9 @@ impl<'d> Reader<'d, '_, '_> {
                     None => c.hash(&mut h),
                 }
             }
-        } else {
-            // Too deep to compare: only the very same node is the same.
+        }
+        if !whole {
+            // Too deep, or too much work, to compare. Only the very same node is the same.
             index.hash(&mut h);
         }
         h.finish()
