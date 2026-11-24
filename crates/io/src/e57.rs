@@ -182,19 +182,7 @@ fn short(text: &str) -> String {
 
 fn element(e: &quick_xml::events::BytesStart) -> Node {
     let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-    let attrs = e
-        .attributes()
-        .flatten()
-        .map(|a| {
-            let k = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
-            let v = a
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
-            (k, v)
-        })
-        .collect();
-    Node { name, attrs, ..Node::default() }
+    Node { name, attrs: crate::xml::attributes(e), ..Node::default() }
 }
 
 /// Read the XML part into its elements.
@@ -1068,6 +1056,45 @@ mod tests {
         }
         for (i, c) in cases.iter().enumerate() {
             assert!(read_e57_cloud(c, 10).is_err(), "case {i} was read");
+        }
+    }
+
+    /// A tag that repeats one attribute name many times reads in time that grows with the tag, and
+    /// of a repeated name the first value is read, as before (#21468).
+    #[test]
+    fn a_tag_that_repeats_a_name_many_times_keeps_its_first_value() {
+        let names = crate::xml::tests::repeated_names(crate::xml::tests::MANY);
+        let root = parse_xml(&format!(r#"<e57Root type="Structure"><data3D type="Vector"{names} type="Structure"/></e57Root>"#)).unwrap();
+        let data = root.child("data3D").unwrap();
+        assert_eq!((data.attr("type"), data.attrs.len()), (Some("Vector"), crate::xml::tests::MANY + 1));
+        // A whole file reads with such a tag in it, here its scan's pose.
+        let moved = pose([1.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0]).replacen(
+            r#"<pose type="Structure""#,
+            &format!(r#"<pose type="Structure"{names} type="Float""#),
+            1,
+        );
+        let r = read_e57_cloud(&e57(&[TestScan { extra: moved, ..xyz(1.0, 2.0, 3.0) }], 1024), 10).unwrap();
+        assert!(near(&r.positions, &[[11.0, 2.0, 3.0]]), "{:?}", r.positions);
+    }
+
+    /// Every tag of a file with three scans, a pose and colour limits reads the same attributes as
+    /// with quick-xml's own check for repeated names (#21468).
+    #[test]
+    fn a_files_tags_read_the_same_attributes_as_before() {
+        let mut scans = two_scans();
+        scans.push(TestScan {
+            extra: r#"<colorLimits type="Structure"><colorRedMaximum type="Integer">255</colorRedMaximum></colorLimits>"#.into(),
+            ..xyz(1.0, 2.0, 3.0)
+        });
+        let file = e57(&scans, 1024);
+        let h = header(&file).unwrap();
+        let l = logical(&file, h.page).unwrap();
+        let start = to_logical(h.xml_offset, h.page).unwrap();
+        let xml = std::str::from_utf8(&l[start..start + h.xml_length as usize]).unwrap();
+        let tags = crate::xml::tests::tags(xml);
+        assert!(tags.len() > 30, "{}", tags.len());
+        for e in &tags {
+            assert_eq!(element(e).attrs, crate::xml::tests::checked(e), "{e:?}");
         }
     }
 }

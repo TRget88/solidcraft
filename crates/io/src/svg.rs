@@ -149,17 +149,7 @@ fn parse_transform(s: &str) -> Tf {
 }
 
 fn attrs(e: &BytesStart) -> Vec<(String, String)> {
-    e.attributes()
-        .flatten()
-        .map(|a| {
-            let k = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
-            let v = a
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
-            (k, v)
-        })
-        .collect()
+    crate::xml::attributes(e)
 }
 
 fn attr<'a>(a: &'a [(String, String)], k: &str) -> Option<&'a str> {
@@ -1405,5 +1395,37 @@ mod tests {
         // Large but finite drawings still read.
         let g = read_svg(&doc(r#"<g transform="scale(1e6)"><circle r="5"/></g>"#)).unwrap();
         assert!(matches!(g[0], Geom2::Circle(_, r) if (r - 5e6).abs() < 1e-3));
+    }
+
+    /// A tag that repeats one attribute name many times reads in time that grows with the tag, and
+    /// of a repeated name the first value is read, as before (#21468).
+    #[test]
+    fn a_tag_that_repeats_a_name_many_times_keeps_its_first_value() {
+        let names = crate::xml::tests::repeated_names(crate::xml::tests::MANY);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100mm" height="100mm"><circle cx="10" cy="20" r="5"{names} r="50" cx="0"/></svg>"#
+        );
+        let g = read_svg(&svg).unwrap();
+        assert!(matches!(g[..], [Geom2::Circle(c, r)] if c.dist(Vec2::new(10.0, -20.0)) < 1e-9 && (r - 5.0).abs() < 1e-9), "{g:?}");
+    }
+
+    /// Every tag of a real drawing (SolidCraft's mark), and of one with namespaces, entities and a
+    /// repeated name, reads the same attributes as with quick-xml's own check (#21468).
+    #[test]
+    fn a_drawings_tags_read_the_same_attributes_as_before() {
+        let mark = include_str!("../../../assets/branding/logo/solidcraft-mark.svg");
+        let other = r##"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="120mm" height="80mm" viewBox="0 0 120 80">
+<title>Bracket &amp; plate</title><defs><symbol id="hole" viewBox="0 0 10 10"><circle cx="5" cy="5" r="2.5"/></symbol></defs>
+<g id="outline" transform="translate(10 10)" style="fill:none;stroke:#000">
+<path d="M0 0 L100 0&#10;L100 60 L0 60 Z" stroke-dasharray="4, 2"/><rect x='20' y='20' width='30' height='10'/>
+<use xlink:href="#hole" href="#hole" x="70" y="25"/><line x1="0" y1="0" x2="10" y2="10" x1="5"/></g></svg>"##;
+        let mut count = 0;
+        for svg in [mark, other] {
+            for e in crate::xml::tests::tags(svg) {
+                assert_eq!(attrs(&e), crate::xml::tests::checked(&e), "{e:?}");
+                count += 1;
+            }
+        }
+        assert!(count > 30, "{count}");
     }
 }

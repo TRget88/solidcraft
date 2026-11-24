@@ -135,6 +135,7 @@ pub mod test_support {
 mod threemf;
 pub mod urdf;
 pub mod vfs;
+mod xml;
 
 pub use airfoil::Airfoil;
 pub use airfoil::AirfoilFormat;

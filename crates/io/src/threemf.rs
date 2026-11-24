@@ -601,17 +601,9 @@ fn read_entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, idx: usize, name: &str, 
     Ok((out.len() as u64 <= limit).then_some(out))
 }
 
+/// The tag's attributes by local name. Of two names with the same local name the later one is kept.
 fn attrs(e: &BytesStart) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    for a in e.attributes().flatten() {
-        let k = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
-        let v = a
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).to_string());
-        m.insert(k, v);
-    }
-    m
+    crate::xml::attributes(e)
 }
 
 /// Row-vector affine transform `[m00 m01 m02 m10 … m32]` (3MF order).
@@ -1315,6 +1307,47 @@ pub(crate) mod tests {
         let max_x = o.positions.iter().map(|p| p.x).fold(f64::MIN, f64::max);
         assert!((max_x - 7.0).abs() < 1e-9, "{max_x}");
         assert!(o.positions.iter().all(|p| p.z >= 2.0 - 1e-9 && p.z <= 4.0 + 1e-9));
+    }
+
+    /// An object tag that repeats one attribute name many times reads in time that grows with the
+    /// tag, and of a repeated name the first value is read, as before (#21468).
+    #[test]
+    fn a_tag_that_repeats_a_name_many_times_keeps_its_first_value() {
+        let names = crate::xml::tests::repeated_names(crate::xml::tests::MANY);
+        let object = tet_object(1, "First", 1.0).replacen(r#"name="First""#, &format!(r#"name="First"{names} name="Second" id="2""#), 1);
+        let model = format!(
+            r#"<?xml version="1.0"?><model unit="millimeter" {PRODUCTION}><resources>{object}</resources><build><item objectid="1"/></build></model>"#
+        );
+        let (read, warnings) = read_3mf(&package(&model, None)).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(read.iter().map(|o| (o.name.as_str(), o.triangles.len())).collect::<Vec<_>>(), [("First", 4)]);
+    }
+
+    /// Every tag of a package SolidCraft writes, and of a project in two model parts as slicers
+    /// save it, reads the same attributes as with quick-xml's own check for repeated names (#21468).
+    #[test]
+    fn real_tags_read_the_same_attributes_as_before() {
+        let mut t = tetra("Cube & \"lid\"");
+        t.color = Some([0.125, 0.25, 0.75]);
+        t.transparency = 0.5;
+        t.looks = vec![([1.0, 0.0, 0.0], 0.0)];
+        t.tri_looks = vec![0, 1, 0, 0];
+        let bytes = write_3mf_parts(&[t, tetra("Dome")], &[("Pair".into(), vec![0, 1])], &[], Some(&b"\x89PNG\r\n\x1a\n"[..])).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+        let mut parts: Vec<String> = ["3D/3dmodel.model", "_rels/.rels", "[Content_Types].xml"]
+            .iter()
+            .map(|p| String::from_utf8(read_part(&mut zip, p).unwrap().unwrap()).unwrap())
+            .collect();
+        parts.extend(production_parts().map(|(_, xml)| xml));
+        let mut count = 0;
+        for xml in &parts {
+            for e in crate::xml::tests::tags(xml) {
+                let before: HashMap<String, String> = crate::xml::tests::checked(&e).into_iter().collect();
+                assert_eq!(attrs(&e), before, "{e:?}");
+                count += 1;
+            }
+        }
+        assert!(count > 40, "{count}");
     }
 
     /// Build items can name another part too, part names compare without regard to case, and
