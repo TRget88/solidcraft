@@ -210,6 +210,10 @@ impl Writer {
 /// unique and plain names, every part's declared size), not the parts.
 pub struct Reader<R: Read + Seek> {
     zip: zip::ZipArchive<R>,
+    /// Each part's place in the container, by the name it reads as. A part is found here, not by
+    /// zip's own lookup, which for a name stored as bytes that are not UTF-8 decodes the names
+    /// before it one by one, and for a name that isn't there decodes them all.
+    places: BTreeMap<String, usize>,
     blobs: BTreeMap<String, Vec<u8>>,
     /// The bytes of payloads resolved so far, repeats counted: bounded by the expanded budget.
     pub hydrated: usize,
@@ -256,15 +260,12 @@ impl<R: Read + Seek> Reader<R> {
         {
             return Err(invalid("duplicate entries or unsupported ZIP directory"));
         }
-        let mut names = BTreeSet::new();
+        let mut places = BTreeMap::new();
         let mut total = 0u64;
         for i in 0..zip.len() {
             let part = zip.by_index_raw(i).map_err(invalid)?;
             let name = part.name().map_err(invalid)?.into_owned();
-            if name.is_empty()
-                || name.contains('\\')
-                || name.split('/').any(|c| c.is_empty() || c == "." || c == "..")
-                || !names.insert(name.to_owned())
+            if name.is_empty() || name.contains('\\') || name.split('/').any(|c| c.is_empty() || c == "." || c == "..") || places.contains_key(&name)
             {
                 return Err(invalid("duplicate or invalid archive entry"));
             }
@@ -273,8 +274,9 @@ impl<R: Read + Seek> Reader<R> {
             if part.size() > limit as u64 || total > (limits.max_expanded)() as u64 {
                 return Err(invalid("expanded package too large"));
             }
+            places.insert(name, i);
         }
-        Ok(Self { zip, blobs: BTreeMap::new(), hydrated: 0, document: None, limits })
+        Ok(Self { zip, places, blobs: BTreeMap::new(), hydrated: 0, document: None, limits })
     }
 
     /// The file's own part, `document.json`, read once and kept: provisional caches and the
@@ -289,7 +291,7 @@ impl<R: Read + Seek> Reader<R> {
 
     /// Whether the container has a part of this name.
     pub fn has_part(&self, name: &str) -> bool {
-        self.zip.index_for_name(name).is_some()
+        self.places.contains_key(name)
     }
 
     /// The names of every part, in the container's order.
@@ -299,16 +301,18 @@ impl<R: Read + Seek> Reader<R> {
 
     /// The names of every part with each one's place in the container, in the container's order.
     /// A name that does not decode is left out. Reading a part by its place
-    /// ([`Self::limited_part_at`]) skips the name lookup, which for a name stored without the
-    /// UTF-8 flag decodes every name in the container.
+    /// ([`Self::limited_part_at`]) needs no lookup of its name.
     pub fn indexed_part_names(&self) -> Vec<(String, usize)> {
         self.zip.file_names().enumerate().filter_map(|(index, name)| name.ok().map(|name| (name.into_owned(), index))).collect()
     }
 
     /// The part of this name, at most `limit` bytes.
     pub fn limited_part(&mut self, name: &str, limit: usize) -> Result<Vec<u8>, FormatError> {
-        let part = self.zip.by_name(name).map_err(|e| invalid(format!("required part `{name}`: {e}")))?;
-        read_limited(part, limit)
+        let part = match self.places.get(name) {
+            Some(&index) => self.zip.by_index(index),
+            None => Err(zip::result::ZipError::FileNotFound),
+        };
+        read_limited(part.map_err(|e| invalid(format!("required part `{name}`: {e}")))?, limit)
     }
 
     /// The part at this place in the container ([`Self::indexed_part_names`]), at most `limit` bytes.

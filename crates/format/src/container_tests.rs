@@ -65,3 +65,30 @@ fn a_thumbnail_is_keyed_to_its_file() {
     let mut reader = Reader::new(Cursor::new(writer.finish().unwrap()), LIMITS).unwrap();
     assert!(picture.read(&mut reader, 64).is_err(), "stale");
 }
+
+/// A part whose name is stored as bytes that are not UTF-8 is found by the name it reads as (code
+/// page 437), and is the same part as at its place. A name that is not there is not found.
+#[test]
+fn a_name_that_is_not_utf8_is_found_as_it_reads() {
+    let mut writer = Writer::new(LIMITS);
+    writer.part("document.json", b"{}", false).unwrap();
+    writer.part("notes/~", b"note", false).unwrap();
+    let mut bytes = writer.finish().unwrap();
+    // The name is in the directory and in the part's own header. Its `~` becomes byte 0x80.
+    let at: Vec<usize> = bytes.windows(7).enumerate().filter(|(_, window)| *window == b"notes/~").map(|(at, _)| at + 6).collect();
+    assert_eq!(at.len(), 2);
+    for at in at {
+        bytes[at] = 0x80;
+    }
+    let mut reader = Reader::new(Cursor::new(bytes), LIMITS).unwrap();
+    let names = reader.indexed_part_names();
+    let index = names.iter().find(|(name, _)| name == "notes/Ç").map(|(_, index)| *index).unwrap();
+    assert!(reader.has_part("notes/Ç") && reader.has_part("document.json"));
+    assert!(!reader.has_part("notes/~") && !reader.has_part("notes/\u{80}") && !reader.has_part("notes/\u{fffd}"));
+    assert_eq!(reader.limited_part("notes/Ç", 64).unwrap(), b"note");
+    assert_eq!(reader.limited_part_at(index, 64).unwrap(), b"note");
+    assert_eq!(
+        reader.limited_part("notes/C", 64).unwrap_err(),
+        FormatError::Invalid("required part `notes/C`: specified file not found in archive".into())
+    );
+}

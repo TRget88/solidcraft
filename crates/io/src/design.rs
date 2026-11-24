@@ -2992,6 +2992,60 @@ mod tests {
         assert_eq!(kept, named);
     }
 
+    /// The container with each `~` in its parts' names stored as byte 0x80, in the directory and in
+    /// each part's own header. Such a name is not UTF-8, so it reads as code page 437 (`Ç`).
+    fn with_names_not_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
+        let u16_at = |bytes: &[u8], at: usize| usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+        let u32_at = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let end = bytes.len() - 22;
+        assert_eq!(&bytes[end..end + 4], b"PK\x05\x06");
+        let mut at = u32_at(&bytes, end + 16);
+        for _ in 0..u16_at(&bytes, end + 10) {
+            let length = u16_at(&bytes, at + 28);
+            for start in [at + 46, u32_at(&bytes, at + 42) + 30] {
+                bytes[start..start + length].iter_mut().filter(|byte| **byte == b'~').for_each(|byte| *byte = 0x80);
+            }
+            at += 46 + length + u16_at(&bytes, at + 30) + u16_at(&bytes, at + 32);
+        }
+        bytes
+    }
+
+    /// A newer build's container keeps parts whose names are stored as bytes that are not UTF-8 as
+    /// it keeps the others. A blob is kept when a kept string is the name it reads as, any other
+    /// part always, each with its bytes. zip's lookup of such a name decodes every name before it,
+    /// so with its lookups this file took seconds to open and a crafted one of 9,998 such parts
+    /// minutes.
+    #[test]
+    fn a_newer_builds_container_keeps_parts_whose_names_are_not_utf8() {
+        let mut entries = parts(&write_design_container(&document()).unwrap());
+        let mut metadata: Value = serde_json::from_slice(&entries["document.json"]).unwrap();
+        metadata["format"] = json!(solidcraft_doc::format::format_string(solidcraft_doc::format::FORMAT + 1));
+        // Each `~` is stored as byte 0x80, which reads as `Ç`.
+        let blobs: Vec<String> = (0..3_000).map(|i| format!("blobs/~{i}")).collect();
+        let notes: Vec<String> = (0..3_000).map(|i| format!("notes/~{i}")).collect();
+        let read_as = |name: &String| name.replace('~', "Ç");
+        // An unread feature names every third blob as it reads. The stored bytes read as UTF-8,
+        // with the byte that isn't UTF-8 replaced, name nothing.
+        let future = json!({
+            "id": 9000,
+            "name": "Lattice1",
+            "type": "gyroid_lattice",
+            "parts": blobs.iter().step_by(3).map(read_as).collect::<Vec<_>>(),
+            "lossy": blobs.iter().skip(1).step_by(3).map(|blob| blob.replace('~', "\u{fffd}")).collect::<Vec<_>>(),
+        });
+        metadata["features"].as_array_mut().unwrap().push(future);
+        entries.insert("document.json".into(), serde_json::to_vec(&metadata).unwrap());
+        for (i, name) in blobs.iter().chain(&notes).enumerate() {
+            entries.insert(name.clone(), format!("part {i}").into_bytes());
+        }
+
+        let opened = crate::read_design(&with_names_not_utf8(package(&entries))).unwrap();
+        let kept: BTreeMap<String, Vec<u8>> =
+            opened.newer_file.as_ref().unwrap().parts.iter().map(|(name, bytes)| (name.clone(), bytes.to_vec())).collect();
+        let expected: BTreeMap<String, Vec<u8>> = blobs.iter().step_by(3).chain(&notes).map(|name| (read_as(name), entries[name].clone())).collect();
+        assert_eq!(kept, expected);
+    }
+
     /// A newer build's import whose records this build cannot read costs that feature, which is
     /// kept as the file has it, not the whole design; so do records this build reads but with a
     /// field it does not have (at the top or within a body), which saving its reading would drop.
