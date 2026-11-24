@@ -10,6 +10,7 @@
 //! 3D frame); the footprint transform is applied by the caller.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use solidcore_record::Vec3;
 use solidcraft_doc::{Mat, mat_mul, rigid};
@@ -22,6 +23,14 @@ pub const MAX_VRML_BYTES: usize = 64 << 20;
 const MAX_TOKENS: usize = 2_000_000;
 const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 500_000;
+/// Largest size of a model with every `USE` written out in full, checked at each `USE`. A token
+/// counts one, and a name or string counts its bytes. Without `USE` that count is never more than
+/// the bytes the tokens take in the file, so such a model always fits, and four times the largest
+/// file leaves room for parts reused up to the vertex and triangle limits. A `USE` shares the node
+/// it names instead of copying it, but reading the model walks that node once for each `USE`, so
+/// this keeps the work in proportion to the limits. A few lines of nested `USE`s that double each
+/// level are refused.
+const MAX_WRITTEN_OUT: usize = 4 * MAX_VRML_BYTES;
 const MAX_VERTICES: usize = 5_000_000;
 const MAX_TRIANGLES: usize = 5_000_000;
 const MAX_NUMBER: f64 = 1.0e9;
@@ -54,7 +63,7 @@ pub fn read_vrml(bytes: &[u8], file: &str) -> Result<VrmlMesh> {
         return Err(IoError::Invalid("VRML 1.0 models are not supported; convert the model to VRML 2.0".into()));
     }
     let tokens = tokenize(source)?;
-    let mut parser = Parser { tokens, next: 0, nodes: 0, defs: HashMap::new() };
+    let mut parser = Parser { tokens, next: 0, nodes: 0, counted: 0, counted_size: 0, reused: 0, defs: HashMap::new() };
     let mut roots = Vec::new();
     while parser.next < parser.tokens.len() {
         if let Some(node) = parser.node(0)? {
@@ -182,7 +191,8 @@ enum Value {
     Text(String),
     Word(String),
     List(Vec<Value>),
-    Node(Box<Node>),
+    /// Shared by every `USE` of the node.
+    Node(Rc<Node>),
     Flag,
 }
 
@@ -226,15 +236,46 @@ impl Node {
     }
 }
 
+/// A `DEF`'s node and what reading it costs, so a `USE` costs what it reuses.
+struct Def {
+    node: Rc<Node>,
+    /// The nodes its subtree holds.
+    nodes: usize,
+    /// Its size written out in full (see [`MAX_WRITTEN_OUT`]).
+    written: usize,
+}
+
+/// A token's share of the model's size written out, never more than the bytes it takes in the file.
+fn written_size(token: &Token<'_>) -> usize {
+    match token {
+        Token::Word(w) => w.len().max(1),
+        Token::Text(t) => t.len().max(1),
+        _ => 1,
+    }
+}
+
 struct Parser<'a> {
     tokens: Vec<Token<'a>>,
     next: usize,
     nodes: usize,
-    /// Each `DEF`'s node and how many nodes its subtree holds, so a `USE` costs what it reuses.
-    defs: HashMap<String, (Node, usize)>,
+    /// The tokens before `counted` (never past `next`) and their size written out.
+    counted: usize,
+    counted_size: usize,
+    /// What `USE`s add to the size written out, beyond their own tokens.
+    reused: usize,
+    defs: HashMap<String, Def>,
 }
 
 impl<'a> Parser<'a> {
+    /// The model read so far, with every `USE` written out in full (see [`MAX_WRITTEN_OUT`]).
+    /// `next` only grows, so each token is counted once.
+    fn written_out(&mut self) -> usize {
+        while self.counted < self.next {
+            self.counted_size = self.counted_size.saturating_add(self.tokens.get(self.counted).map_or(0, written_size));
+            self.counted += 1;
+        }
+        self.counted_size.saturating_add(self.reused)
+    }
     fn peek(&self) -> Option<&Token<'a>> {
         self.tokens.get(self.next)
     }
@@ -255,7 +296,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A node, `DEF`/`USE`, or `None` for a stray token that is skipped.
-    fn node(&mut self, depth: usize) -> Result<Option<Node>> {
+    fn node(&mut self, depth: usize) -> Result<Option<Rc<Node>>> {
         if depth > MAX_DEPTH {
             return Err(IoError::Invalid(format!("VRML model nesting exceeds {MAX_DEPTH}")));
         }
@@ -269,19 +310,30 @@ impl<'a> Parser<'a> {
         };
         if first.eq_ignore_ascii_case("DEF") {
             let Some(name) = self.word() else { return Ok(None) };
-            let before = self.nodes;
+            let (nodes_before, written_before) = (self.nodes, self.written_out());
             let node = self.node(depth + 1)?.ok_or_else(|| IoError::Invalid("DEF without a node in VRML model".into()))?;
-            self.defs.insert(name, (node.clone(), self.nodes.saturating_sub(before)));
+            let def = Def {
+                node: Rc::clone(&node),
+                nodes: self.nodes.saturating_sub(nodes_before),
+                written: self.written_out().saturating_sub(written_before),
+            };
+            self.defs.insert(name, def);
             return Ok(Some(node));
         }
         if first.eq_ignore_ascii_case("USE") {
             let Some(name) = self.word() else { return Ok(None) };
-            // A `USE` materializes the whole referenced subtree again, so it costs as many
-            // nodes as the definition held: a file cannot repeat one subtree to blow the limit.
-            let Some((node, size)) = self.defs.get(&name).cloned() else { return Ok(None) };
+            // A `USE` shares the node, but reading the model walks the whole subtree again, so it
+            // costs as many nodes and as much written-out size as the definition held. A file
+            // cannot repeat one subtree to pass either limit.
+            let Some(def) = self.defs.get(&name) else { return Ok(None) };
+            let (node, size, written) = (Rc::clone(&def.node), def.nodes, def.written);
             self.nodes = self.nodes.saturating_add(size);
             if self.nodes > MAX_NODES {
                 return Err(IoError::Invalid(format!("VRML model has more than {MAX_NODES} nodes")));
+            }
+            self.reused = self.reused.saturating_add(written);
+            if self.written_out() > MAX_WRITTEN_OUT {
+                return Err(IoError::Invalid(format!("VRML model reuses parts too often (over {} MB written out)", MAX_WRITTEN_OUT >> 20)));
             }
             return Ok(Some(node));
         }
@@ -315,7 +367,7 @@ impl<'a> Parser<'a> {
             }
             // Some primitives may appear bare (`Box { }` always has braces, but a definition
             // may end here); treat a missing body as empty.
-            _ => return Ok(Some(node)),
+            _ => return Ok(Some(Rc::new(node))),
         }
         loop {
             match self.peek() {
@@ -344,7 +396,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Some(node))
+        Ok(Some(Rc::new(node)))
     }
 
     fn value(&mut self, depth: usize) -> Result<Value> {
@@ -382,7 +434,7 @@ impl<'a> Parser<'a> {
                     || matches!(self.tokens.get(self.next), Some(Token::Word(w)) if w.eq_ignore_ascii_case("DEF") || w.eq_ignore_ascii_case("USE"));
                 if starts_node {
                     match self.node(depth + 1)? {
-                        Some(n) => Ok(Value::Node(Box::new(n))),
+                        Some(n) => Ok(Value::Node(n)),
                         None => Ok(Value::Flag),
                     }
                 } else {
