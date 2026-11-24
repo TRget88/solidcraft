@@ -23,7 +23,8 @@ const TAU: f64 = std::f64::consts::TAU;
 const MAX_MACRO_PRIMITIVES: usize = 4096;
 /// Most outline points one macro primitive may have.
 const MAX_OUTLINE_POINTS: usize = 10_000;
-/// Deepest nesting of parentheses in a macro expression.
+/// Deepest nesting in a macro expression. Each bracket and each sign in front of a value is one
+/// level, and the reader goes one call deeper for each, so this also bounds the stack it needs.
 const MAX_DEPTH: usize = 32;
 /// Most contours one region may split into.
 const MAX_REGION_LOOPS: usize = 4096;
@@ -897,7 +898,8 @@ fn run_macro(body: &str, params: Vec<f64>) -> Result<Vec<Island>, String> {
 }
 
 /// A macro expression: numbers, `$n` variables, `+ - x /` with the usual precedence (`x` and
-/// `X` multiply) and parentheses.
+/// `X` multiply) and parentheses. A chain of operators is read in a loop. A bracket or a sign in
+/// front of a value goes one call deeper, at most [`MAX_DEPTH`] in all.
 fn eval(expr: &str, vars: &HashMap<u32, f64>) -> Result<f64, String> {
     let chars: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
     let mut p = Expr { s: &chars, k: 0, vars, depth: 0 };
@@ -940,15 +942,27 @@ impl Expr<'_> {
         Ok(v)
     }
 
+    /// `read` one nesting level deeper (inside a bracket or after a sign), refused past
+    /// [`MAX_DEPTH`] levels so that no file can run the stack out.
+    fn nested(&mut self, read: impl FnOnce(&mut Self) -> Result<f64, String>) -> Result<f64, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(format!("an aperture macro has an expression with more than {MAX_DEPTH} signs and brackets inside each other"));
+        }
+        self.depth += 1;
+        let v = read(self)?;
+        self.depth -= 1;
+        Ok(v)
+    }
+
     fn unary(&mut self) -> Result<f64, String> {
         match self.peek() {
             Some('-') => {
                 self.k += 1;
-                Ok(-self.unary()?)
+                Ok(-self.nested(Self::unary)?)
             }
             Some('+') => {
                 self.k += 1;
-                self.unary()
+                self.nested(Self::unary)
             }
             _ => self.atom(),
         }
@@ -958,17 +972,12 @@ impl Expr<'_> {
         let bad = || "an aperture macro has an expression that cannot be read".to_string();
         match self.peek() {
             Some('(') => {
-                self.depth += 1;
-                if self.depth > MAX_DEPTH {
-                    return Err(bad());
-                }
                 self.k += 1;
-                let v = self.sum()?;
+                let v = self.nested(Self::sum)?;
                 if self.peek() != Some(')') {
                     return Err(bad());
                 }
                 self.k += 1;
-                self.depth -= 1;
                 Ok(v)
             }
             Some('$') => {

@@ -588,6 +588,35 @@ fn an_aperture_macro_with_expressions_and_an_erasing_primitive() {
     assert!((covered(&l) - (8.0 - std::f64::consts::PI * 0.25)).abs() < 1e-9, "{}", covered(&l));
 }
 
+/// Each sign or bracket in a macro expression takes the reader one call deeper, and signs had no
+/// bound, so a copper layer whose macro has a million minus signs in a row (about 1 MB) ran the
+/// stack out and ended the app (#21468). Past 32 levels the aperture is now skipped with a
+/// warning. It runs on a thread with a 1 MiB stack, as small as a window thread's on Windows.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_macro_expression_nested_too_deep_is_skipped_not_a_stack_overflow() {
+    let refused =
+        |l: &GerberLayer| l.loops.is_empty() && l.warnings.iter().any(|w| w.contains("Skipped an aperture") && w.contains("inside each other"));
+    let signs = "-".repeat(1_000_000);
+    let l = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || layer(&format!("%AMBOOM*1,1,{signs}1,0,0*%%ADD10BOOM*%D10*X0Y0D03*")))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(refused(&l), "{:?} {:?}", l.loops, l.warnings);
+    // With $1 = 2 and $2 = 1, a diameter of -(+(-($1 x (-$2 + 3)))) = 4, eight levels deep.
+    let l = layer("%AMMIX*1,1,-(+(-($1x(-$2+3)))),0,0*%%ADD10MIX,2X1*%D10*X0Y0D03*");
+    assert!((covered(&l) - 4.0 * std::f64::consts::PI).abs() < 1e-9, "{} {:?}", covered(&l), l.warnings);
+    // 16 signs and 16 brackets are the 32 levels allowed, a diameter of $1 = 2.
+    let deepest = format!("{}$1{}", "-(".repeat(16), ")".repeat(16));
+    let l = layer(&format!("%AMDEEP*1,1,{deepest},0,0*%%ADD10DEEP,2*%D10*X0Y0D03*"));
+    assert!((covered(&l) - std::f64::consts::PI).abs() < 1e-9, "{} {:?}", covered(&l), l.warnings);
+    // One sign more is a level too many.
+    let l = layer(&format!("%AMDEEP*1,1,+{deepest},0,0*%%ADD10DEEP,2*%D10*X0Y0D03*"));
+    assert!(refused(&l), "{:?} {:?}", l.loops, l.warnings);
+}
+
 #[test]
 fn a_circle_drawn_with_a_round_aperture_is_a_ring() {
     let l = layer("%ADD10C,0.2*%D10*X2000000Y0D02*G03*X2000000Y0I-2000000J0D01*");
