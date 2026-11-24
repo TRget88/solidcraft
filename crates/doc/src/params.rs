@@ -396,21 +396,28 @@ impl Document {
         let all = self.all_param_exprs();
         let refs: BTreeMap<String, Vec<String>> = all.iter().map(|(n, e, _)| (n.clone(), expr::references(e))).collect();
         // Who uses each name, in name order: one pass over the references (a design an agent
-        // built names every feature input, so a search per row was quadratic).
+        // built names every feature input, so a search per row was quadratic). Only a name with
+        // a number row of its own (a key of `refs`) is kept, since only those rows list users.
         let mut users: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for (k, r) in &refs {
-            for x in r {
+            for x in r.iter().filter(|x| refs.contains_key(x.as_str())) {
                 users.entry(x.as_str()).or_default().push(k.clone());
             }
         }
         // A feature that reads a parameter itself (a sketch point at `a`) is one of its users
-        // too, named as `parameters.graph` names it (#12293).
-        let rules = self.rule_reads();
-        let reads: Vec<(String, BTreeSet<String>)> =
-            self.features.iter().map(|f| (format!("Feature:{}", f.name), Self::feature_reads(f, &rules))).collect();
-        for (feature, names) in &reads {
-            for n in names {
-                users.entry(n.as_str()).or_default().push(feature.clone());
+        // too, named as `parameters.graph` names it (#12293). Every sheet metal or plastic
+        // feature reads every name its kind of rule reads, so the rules' names without a row are
+        // dropped first. Kept, they were copied once for each such feature, and a design file of
+        // a few MB could ask for gigabytes that no row shows.
+        let rules = self.rule_reads().with_rows(&refs);
+        for f in &self.features {
+            let feature = format!("Feature:{}", f.name);
+            for n in Self::feature_reads(f, &rules) {
+                #[cfg(test)]
+                param_rows_tests::count_feature_read();
+                if let Some((n, _)) = refs.get_key_value(n.as_str()) {
+                    users.entry(n.as_str()).or_default().push(feature.clone());
+                }
             }
         }
         let used_by = |n: &str| -> Vec<String> { users.get(n).cloned().unwrap_or_default() };
@@ -782,6 +789,14 @@ fn doc_len(units: &str) -> f64 {
 struct RuleReads {
     sheet: BTreeSet<String>,
     plastic: BTreeSet<String>,
+}
+
+impl RuleReads {
+    /// Only the names that are keys of `rows`, the names a row of the parameters table has.
+    fn with_rows<V>(self, rows: &BTreeMap<String, V>) -> RuleReads {
+        let keep = |names: BTreeSet<String>| names.into_iter().filter(|n| rows.contains_key(n)).collect();
+        RuleReads { sheet: keep(self.sheet), plastic: keep(self.plastic) }
+    }
 }
 
 impl Document {
@@ -1542,9 +1557,16 @@ pub(crate) mod param_rows_tests {
     use crate::{Document, FacePick, Feature, FeatureKind, Operation, Param, PlaneRef, ProfileSel, SketchId};
 
     thread_local! {
+        static FEATURE_READS: Cell<usize> = const { Cell::new(0) };
         static PARAM_SEARCHES: Cell<usize> = const { Cell::new(0) };
         static RULES_READ: Cell<usize> = const { Cell::new(0) };
         static WORDS_READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A name a feature reads itself that [`Document::param_rows`] walks on this thread, whether
+    /// or not it keeps the feature as that name's user.
+    pub(crate) fn count_feature_read() {
+        FEATURE_READS.set(FEATURE_READS.get() + 1);
     }
 
     /// A search of the parameter list by name on this thread ([`Document::param`]).
@@ -1925,6 +1947,38 @@ pub(crate) mod param_rows_tests {
         assert!(RULES_READ.get() <= rules * (8 + 10), "{}", RULES_READ.get());
         // `p0` lists every feature, in timeline order.
         let all: Vec<String> = (0..features).map(|i| format!("Feature:F{i}")).collect();
+        assert_eq!(rows[0].used_by, all);
+    }
+
+    /// Building the rows walks only the names the rules read that a row has, for each sheet metal
+    /// or plastic feature, and keeps the feature as a user of those alone. Each name the rules
+    /// read was copied, walked and kept once for every such feature, so rules naming thousands of
+    /// names no row has, with thousands of such features, asked for gigabytes that no row shows.
+    #[test]
+    fn the_rows_keep_no_copy_for_each_feature_of_rule_names_that_no_row_has() {
+        let (rules, features) = (40, 60);
+        let mut doc = rules_read_by_features(rules, features);
+        // A sheet metal rule's gap and a plastic rule's clearance also read five names of the
+        // rule's own that nothing has.
+        let unknown = |kind: &str, i: usize| (0..5).map(|k| format!("{kind}{i}_{k}")).collect::<Vec<_>>().join(" + ");
+        for (i, rule) in doc.sheet.rules.iter_mut().enumerate() {
+            rule.gap = unknown("q", i);
+        }
+        for (i, rule) in doc.plastic.rules.iter_mut().enumerate() {
+            rule.clearance = unknown("v", i);
+        }
+        FEATURE_READS.set(0);
+        let rows = doc.param_rows();
+        // `p0` is the one name the rules read that has a row, so it is the one name walked for
+        // each of the 60 features, which is kept once, as its user. Without the cut of the rules'
+        // names, each of the 30 sheet metal and 30 plastic features walked `p0` and the
+        // 40 × 5 = 200 unknown names of its kind, 60 × (1 + 200) = 12,060, whether it was then
+        // kept as their user (the previous code) or not.
+        assert_eq!(FEATURE_READS.get(), features);
+        // The rows are the ones the old code gave. `p0` lists every feature, in timeline order.
+        assert_eq!(format!("{rows:?}"), format!("{:?}", old_param_rows(&doc)));
+        let all: Vec<String> = (0..features).map(|i| format!("Feature:F{i}")).collect();
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].used_by, all);
     }
 }
