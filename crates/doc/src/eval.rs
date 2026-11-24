@@ -5330,8 +5330,12 @@ fn pattern_copy_name(names: &mut BodyNames, f: &Feature, slot: Option<usize>, so
 }
 
 fn copy_body_name(state: &ModelState, f: &Feature, k: usize, source: &str) -> String {
-    let base = f.body_names.get(k).filter(|name| !name.trim().is_empty()).map(String::as_str).unwrap_or(source);
-    unique_body_name(state, base)
+    unique_body_name(state, copy_base_name(f, k, source))
+}
+
+/// The name output `k` of a feature asks for, its stored name or else `source`.
+fn copy_base_name<'a>(f: &'a Feature, k: usize, source: &'a str) -> &'a str {
+    f.body_names.get(k).filter(|name| !name.trim().is_empty()).map(String::as_str).unwrap_or(source)
 }
 
 /// Reads what a feature cut from a sheet made from surfaces back onto its sheet, and puts the
@@ -14707,8 +14711,12 @@ fn eval_feature_kind(
             Ok(())
         }
         FeatureKind::MeshImport { meshes, .. } => {
+            // A file can give thousands of meshes one name (a 3MF placing one object many
+            // times). They get the names `copy_body_name` gives one at a time, taken from a set
+            // instead of searching all the bodies for every candidate, which was cubic (#21468).
+            let mut names = BodyNames::new(st);
             for (k, (name, b)) in mesh_bodies(meshes, prepared_meshes)?.into_iter().enumerate() {
-                let name = copy_body_name(st, f, k, &name);
+                let name = names.unique(copy_base_name(f, k, &name));
                 st.bodies.push(ModelBody::new(name, b, f.id));
             }
             Ok(())
@@ -16541,6 +16549,108 @@ mod body_name_tests {
         // After first-free naming from 2, a later start never hands out a name twice.
         assert_eq!(names.unique("Pin"), "Pin (2)");
         assert_eq!(names.first_free("Pin", 2), "Pin (3)");
+    }
+
+    /// A design of mesh imports, one feature for each `(mesh names, stored body names)`, every
+    /// mesh a small tetrahedron.
+    fn mesh_imports(features: &[(Vec<&str>, Vec<&str>)]) -> Document {
+        let mut doc = Document::new("mesh names");
+        for (names, stored) in features {
+            let meshes = names
+                .iter()
+                .map(|name| crate::MeshData {
+                    name: (*name).to_string(),
+                    positions: [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0].into(),
+                    triangles: [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3].into(),
+                    color: None,
+                    corner_normals: Default::default(),
+                })
+                .collect();
+            let id = doc.add_feature(FeatureKind::MeshImport { file: "meshes.3mf".into(), meshes }, None).unwrap();
+            doc.feature_mut(id).unwrap().body_names = stored.iter().map(|n| (*n).to_string()).collect();
+        }
+        doc
+    }
+
+    /// The body names of `doc` evaluated.
+    fn evaluated_names(doc: &Document) -> Vec<String> {
+        let mut model = Model::new();
+        model.evaluate(doc);
+        assert!(model.results.iter().all(|r| r.error.is_none()), "{:?}", model.results.iter().find_map(|r| r.error.clone()));
+        model.state().bodies.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// The names mesh imports gave before they were named from a set, by `copy_body_name` and
+    /// `unique_body_name` as they were, which searched all the bodies for every candidate.
+    fn names_searched_one_at_a_time(doc: &Document) -> Vec<String> {
+        fn old_copy_body_name(state: &ModelState, f: &Feature, k: usize, source: &str) -> String {
+            let base = f.body_names.get(k).filter(|name| !name.trim().is_empty()).map(String::as_str).unwrap_or(source);
+            old_unique_body_name(state, base)
+        }
+        fn old_unique_body_name(st: &ModelState, base: &str) -> String {
+            let base = if base.trim().is_empty() { "Body" } else { base.trim() };
+            if st.body(base).is_none() {
+                return base.to_string();
+            }
+            (2..).map(|i| format!("{base} ({i})")).find(|n| st.body(n).is_none()).unwrap_or_else(|| base.to_string())
+        }
+        let body = kernel::box_solid(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)).unwrap();
+        let mut st = ModelState::default();
+        for f in &doc.features {
+            let FeatureKind::MeshImport { meshes, .. } = &f.kind else { panic!("a mesh import") };
+            for (k, mesh) in meshes.iter().enumerate() {
+                let name = old_copy_body_name(&st, f, k, &mesh.name);
+                st.bodies.push(ModelBody::new(name, body.clone(), f.id));
+            }
+        }
+        st.bodies.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// Meshes sharing a name get the names that searching the bodies one candidate at a time
+    /// gave them, numbered past the names other bodies hold, whatever mix of names the meshes
+    /// and the stored names bring (#21468).
+    #[test]
+    fn meshes_sharing_a_name_get_the_names_one_at_a_time_naming_gave() {
+        let doc = mesh_imports(&[(vec!["A (3)", "A (x)"], vec![]), (vec!["A", "A", "A", "A (2)", "A"], vec![])]);
+        let names = evaluated_names(&doc);
+        assert_eq!(names, ["A (3)", "A (x)", "A", "A (2)", "A (4)", "A (2) (2)", "A (5)"]);
+        assert_eq!(names, names_searched_one_at_a_time(&doc));
+        // Names that look like numbered copies, blanks, padded names and stored names.
+        let pool = ["A", "A", "A", "A", "A (2)", "A (3)", "A (x)", "A (", "A ()", "A (02)", " A ", "A  (4)", "", " ", "Body", "Body (2)", "B", "a"];
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut pick = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            pool[(seed % pool.len() as u64) as usize]
+        };
+        for round in 0..12 {
+            let taken: Vec<&str> = (0..6).map(|_| pick()).collect();
+            let taken_stored: Vec<&str> = (0..3).map(|_| pick()).collect();
+            let meshes: Vec<&str> = (0..60).map(|_| pick()).collect();
+            let stored: Vec<&str> = (0..30).map(|_| pick()).collect();
+            let doc = mesh_imports(&[(taken, taken_stored), (meshes, stored)]);
+            assert_eq!(evaluated_names(&doc), names_searched_one_at_a_time(&doc), "round {round}");
+        }
+    }
+
+    /// A file of a thousand meshes of one name (a 3MF placing one object a thousand times) is
+    /// named without searching the bodies. Searching them for every candidate name made such an
+    /// import cubic in the meshes, so a 3MF file of about 1 KB could take an hour (#21468).
+    #[test]
+    fn a_thousand_meshes_of_one_name_are_named_without_searching_the_bodies() {
+        let searches = |count: usize| {
+            let doc = mesh_imports(&[(vec!["A"; count], vec!["A"; count])]);
+            let mut model = Model::new();
+            let work = cost_tests::counted(|| model.evaluate(&doc));
+            assert!(model.results.iter().all(|r| r.error.is_none()));
+            let st = model.state();
+            assert_eq!(st.bodies.len(), count);
+            assert_eq!(st.bodies.last().map(|b| b.name.clone()), Some(format!("A ({count})")));
+            work.body_searches
+        };
+        let (few, many) = (searches(10), searches(1000));
+        assert_eq!(few, many, "searches grew with the meshes, {few} for 10 meshes and {many} for 1000");
     }
 
     /// A 10 mm cube from `x` along x.
