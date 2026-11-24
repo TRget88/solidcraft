@@ -16,6 +16,10 @@
 //! (`/images2D`) are passed over. The file is untrusted: every checksum is checked, every offset
 //! and count is checked against its size, and the packets of all the scans together may not add
 //! up to more than the file (scans that share their points would be read again and again).
+//! For each packet of points that holds a value only how far it is from the one before it is kept,
+//! in a byte or a few, and each field finds its runs in those packets as its values are read.
+//! Index and padding packets and packets whose every run is empty are stepped over once and take
+//! no memory.
 
 use solidcraft_doc::point_cloud::{Column, Complex, Floats, MAX_POINTS, On};
 
@@ -299,19 +303,101 @@ impl Field {
     }
 }
 
+/// A scan's section of points in the file's bytes `l` without checksums. It holds where its first
+/// packet is, where the section ends, how many fields each packet of points holds a run for, and
+/// where its packets of points that hold a value are. `skips` gives, for each of those, how many
+/// bytes after the end of the one before it (or after `first`) it starts, in groups of 7 bits,
+/// lowest first, with the top bit set on every group but the last. A distance under 128 takes one
+/// byte, and a packet that holds a value is at least 9 bytes long, so `skips` is at most a ninth of
+/// the section. Index and padding packets and packets whose every run is empty are not in it.
+struct Section<'a> {
+    l: &'a [u8],
+    first: usize,
+    end: usize,
+    fields: usize,
+    skips: Vec<u8>,
+}
+
+/// Add the distance `n` to a section's skips.
+fn push_skip(skips: &mut Vec<u8>, mut n: usize) {
+    while n >= 0x80 {
+        skips.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    skips.push(n as u8);
+}
+
+/// The next distance in a section's skips, which it moves past, or `None` after the last one.
+fn next_skip(skips: &mut &[u8]) -> Option<usize> {
+    let mut n = 0;
+    for shift in (0..usize::BITS).step_by(7) {
+        let (&b, rest) = skips.split_first()?;
+        *skips = rest;
+        n |= usize::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(n);
+        }
+    }
+    None
+}
+
+impl<'a> Section<'a> {
+    /// The kind and the bytes of the packet at `at`, which must end inside the section.
+    fn packet(&self, at: usize) -> Result<(u8, &'a [u8])> {
+        let kind = *self.l.get(at).ok_or_else(early)?;
+        let length = usize::from(u16_at(self.l, at + 2)?) + 1;
+        let packet = self.l.get(at..at + length).filter(|_| at + length <= self.end).ok_or_else(early)?;
+        Ok((kind, packet))
+    }
+}
+
+fn long_runs() -> IoError {
+    invalid("a packet's runs of values are longer than the packet")
+}
+
+/// The run of bytes a packet of points with runs for `fields` fields holds for the field `i`. The
+/// runs follow their lengths, in the order of the fields.
+fn run(packet: &[u8], fields: usize, i: usize) -> Result<&[u8]> {
+    let len = usize::from(u16_at(packet, 6 + 2 * i)?);
+    if len == 0 {
+        return Ok(&[]);
+    }
+    let mut from = 6 + 2 * fields;
+    for before in 0..i {
+        from += usize::from(u16_at(packet, 6 + 2 * before)?);
+    }
+    packet.get(from..from + len).ok_or_else(long_runs)
+}
+
 /// A field's packed values: the runs of bytes the packets hold for it, read as one stream of bits,
-/// lowest bit first.
-#[derive(Clone)]
-struct Stream<'a> {
-    chunks: std::sync::Arc<Vec<&'a [u8]>>,
-    chunk: usize,
-    byte: usize,
+/// lowest bit first. Each run is found in its packet when the one before it is used up.
+struct Stream<'s> {
+    section: &'s Section<'s>,
+    field: usize,
+    /// The skips to the packets after the one being read.
+    skips: &'s [u8],
+    /// Where the packet being read ends.
+    end: usize,
+    /// The bytes of the current run not read yet.
+    run: &'s [u8],
     bit: u32,
 }
 
-impl<'a> Stream<'a> {
-    fn new(chunks: std::sync::Arc<Vec<&'a [u8]>>) -> Stream<'a> {
-        Stream { chunks, chunk: 0, byte: 0, bit: 0 }
+impl<'s> Stream<'s> {
+    fn new(section: &'s Section<'s>, field: usize) -> Stream<'s> {
+        Stream { section, field, skips: &section.skips, end: section.first, run: &[], bit: 0 }
+    }
+
+    /// Move on to the field's next run that holds a byte.
+    fn next_run(&mut self) -> Result<()> {
+        while self.run.is_empty() {
+            let skip = next_skip(&mut self.skips).ok_or_else(|| invalid("a scan has fewer values than points"))?;
+            let at = self.end.checked_add(skip).ok_or_else(early)?;
+            let (_, packet) = self.section.packet(at)?;
+            self.end = at + packet.len();
+            self.run = run(packet, self.section.fields, self.field)?;
+        }
+        Ok(())
     }
 
     /// The next `n` bits (at most 64), lowest first.
@@ -319,16 +405,8 @@ impl<'a> Stream<'a> {
         let mut value = 0u64;
         let mut got = 0;
         while got < n {
-            let b = loop {
-                let chunk = self.chunks.get(self.chunk).ok_or_else(|| invalid("a scan has fewer values than points"))?;
-                match chunk.get(self.byte) {
-                    Some(b) => break *b,
-                    None => {
-                        self.chunk += 1;
-                        self.byte = 0;
-                    }
-                }
-            };
+            self.next_run()?;
+            let b = *self.run.first().ok_or_else(early)?;
             let take = (8 - self.bit).min(n - got);
             let part = u64::from(b >> self.bit) & ((1u64 << take) - 1);
             value |= part << got;
@@ -336,7 +414,7 @@ impl<'a> Stream<'a> {
             self.bit += take;
             if self.bit == 8 {
                 self.bit = 0;
-                self.byte += 1;
+                self.run = self.run.get(1..).unwrap_or_default();
             }
         }
         Ok(value)
@@ -352,10 +430,10 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// One scan: its fields, the runs of bytes for each, its number of points and its pose.
+/// One scan, with its fields, the section its values are in, its number of points and its pose.
 struct Scan<'a> {
     fields: Vec<Field>,
-    streams: Vec<std::sync::Arc<Vec<&'a [u8]>>>,
+    section: Section<'a>,
     records: u64,
     rotation: [[f64; 3]; 3],
     translation: [f64; 3],
@@ -385,22 +463,27 @@ struct Budget {
     constant_points: u64,
 }
 
-/// The runs of bytes each of a scan's `fields` fields has in the section at `start`.
-fn packets<'a>(l: &'a [u8], start: usize, page: usize, fields: usize, budget: &mut Budget) -> Result<Vec<Vec<&'a [u8]>>> {
+/// The section at `start` of a scan whose points have `fields` fields, after checking every packet
+/// in it, and the number of bits of values its packets hold.
+fn packets<'a>(l: &'a [u8], start: usize, page: usize, fields: usize, budget: &mut Budget) -> Result<(Section<'a>, u64)> {
     // The section header: its kind (1, points), its length and where its first packet is.
     if l.get(start) != Some(&1) {
         return Err(invalid("a scan's points are not in a section of points"));
     }
     let length = usize::try_from(u64_at(l, start + 8)?).map_err(|_| early())?;
     let end = start.checked_add(length).filter(|e| *e <= l.len()).ok_or_else(early)?;
-    let mut at = to_logical(u64_at(l, start + 16)?, page)?;
-    let mut out: Vec<Vec<&[u8]>> = vec![Vec::new(); fields];
+    let first = to_logical(u64_at(l, start + 16)?, page)?;
+    let mut section = Section { l, first, end, fields, skips: Vec::new() };
+    let mut bits = 0u64;
+    let mut at = first;
+    // Where the last packet of points that holds a value ends.
+    let mut after = first;
     while at < end {
-        let kind = *l.get(at).ok_or_else(early)?;
-        let length = usize::from(u16_at(l, at + 2)?) + 1;
-        let packet = l.get(at..at + length).filter(|_| at + length <= end).ok_or_else(early)?;
-        budget.bytes =
-            budget.bytes.checked_sub(length).ok_or_else(|| invalid("the scans' packets add up to more than the file: scans share their points"))?;
+        let (kind, packet) = section.packet(at)?;
+        budget.bytes = budget
+            .bytes
+            .checked_sub(packet.len())
+            .ok_or_else(|| invalid("the scans' packets add up to more than the file: scans share their points"))?;
         match kind {
             // Points: the number of runs, their lengths, then the runs.
             1 => {
@@ -408,20 +491,28 @@ fn packets<'a>(l: &'a [u8], start: usize, page: usize, fields: usize, budget: &m
                 if n != fields {
                     return Err(invalid(format!("a packet has {n} runs of values for {fields} fields")));
                 }
-                let mut from = 6 + 2 * n;
-                for (i, runs) in out.iter_mut().enumerate() {
-                    let len = usize::from(u16_at(packet, 6 + 2 * i)?);
-                    runs.push(packet.get(from..from + len).ok_or_else(|| invalid("a packet's runs of values are longer than the packet"))?);
-                    from += len;
+                let runs = 6 + 2 * n;
+                let mut to = runs;
+                for i in 0..n {
+                    to += usize::from(u16_at(packet, 6 + 2 * i)?);
+                    if to > packet.len() {
+                        return Err(long_runs());
+                    }
                 }
+                if to > runs {
+                    push_skip(&mut section.skips, at - after);
+                    after = at + packet.len();
+                }
+                bits += (to - runs) as u64 * 8;
             }
             // An index of the packets, or padding.
             0 | 2 => {}
             other => return Err(invalid(format!("a packet of an unknown kind ({other})"))),
         }
-        at += length;
+        at += packet.len();
     }
-    Ok(out)
+    section.skips.shrink_to_fit();
+    Ok((section, bits))
 }
 
 fn scan<'a>(n: &Node, l: &'a [u8], page: usize, budget: &mut Budget) -> Result<Scan<'a>> {
@@ -441,10 +532,9 @@ fn scan<'a>(n: &Node, l: &'a [u8], page: usize, budget: &mut Budget) -> Result<S
     let records = points.integer_attr("recordCount", 0)?;
     let records = u64::try_from(records).map_err(|_| invalid("a scan has fewer than no points"))?;
     let offset = u64::try_from(points.integer_attr("fileOffset", -1)?).map_err(|_| invalid("a scan does not say where its points are"))?;
-    let streams = packets(l, to_logical(offset, page)?, page, fields.len(), budget)?;
+    let (section, bits) = packets(l, to_logical(offset, page)?, page, fields.len(), budget)?;
     // A point takes at least one bit, unless every field holds one value: then its points take
     // none, and only as many are made as a cloud can hold.
-    let bits: u64 = streams.iter().flatten().map(|r| r.len() as u64 * 8).sum();
     if bits == 0 {
         budget.constant_points =
             budget.constant_points.checked_sub(records).ok_or_else(|| invalid(format!("a scan says it has {records} points of one value each")))?;
@@ -472,7 +562,7 @@ fn scan<'a>(n: &Node, l: &'a [u8], page: usize, budget: &mut Budget) -> Result<S
             *slot = (hi > lo).then_some((lo, hi));
         }
     }
-    Ok(Scan { fields, streams: streams.into_iter().map(std::sync::Arc::new).collect(), records, rotation: rotation(q)?, translation, color_limits })
+    Ok(Scan { fields, section, records, rotation: rotation(q)?, translation, color_limits })
 }
 
 /// Where in a scan's fields each value a point needs is.
@@ -524,13 +614,13 @@ impl Roles {
 struct Points<'s, 'a> {
     scan: &'s Scan<'a>,
     roles: &'s Roles,
-    streams: Vec<Option<Stream<'a>>>,
+    streams: Vec<Option<Stream<'s>>>,
 }
 
 impl<'s, 'a> Points<'s, 'a> {
     /// Read the fields `used` asks for; the others are passed over.
     fn new(scan: &'s Scan<'a>, roles: &'s Roles, used: &[usize]) -> Points<'s, 'a> {
-        let streams = scan.streams.iter().enumerate().map(|(i, s)| used.contains(&i).then(|| Stream::new(s.clone()))).collect();
+        let streams = (0..scan.fields.len()).map(|i| used.contains(&i).then(|| Stream::new(&scan.section, i))).collect();
         Points { scan, roles, streams }
     }
 
@@ -960,6 +1050,70 @@ mod tests {
         assert!(near(&r.positions, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]), "{:?}", r.positions);
         assert_eq!(intensity(&r), vec![0.0, 5.0]);
         assert!(r.complex.column("intensity", On::Point).unwrap().integer);
+    }
+
+    #[test]
+    fn thousands_of_packets_of_empty_runs_are_read_through_to_the_points_after_them() {
+        // As many fields as a point may have, x, y and z first, the others holding one value.
+        let mut prototype = String::from("<cartesianX type=\"Float\"/><cartesianY type=\"Float\"/><cartesianZ type=\"Float\"/>");
+        for i in 3..MAX_FIELDS {
+            prototype += &format!("<f{i} type=\"Integer\" minimum=\"0\" maximum=\"0\"/>");
+        }
+        // A section of `packets` at the start of the data, and its scan of `records` points.
+        let file = |packets: &[u8], records: u64| {
+            let mut l = vec![0u8; HEADER];
+            l.extend([1, 0, 0, 0, 0, 0, 0, 0]);
+            l.extend((32 + packets.len() as u64).to_le_bytes());
+            l.extend((HEADER as u64 + 32).to_le_bytes());
+            l.extend(0u64.to_le_bytes());
+            l.extend(packets);
+            let xml = format!(
+                "<e57Root type=\"Structure\"><data3D type=\"Vector\"><vectorChild type=\"Structure\"><points type=\"CompressedVector\" \
+                 fileOffset=\"{HEADER}\" recordCount=\"{records}\"><prototype type=\"Structure\">{prototype}</prototype></points>\
+                 </vectorChild></data3D></e57Root>"
+            );
+            let at = l.len();
+            l.extend(xml.as_bytes());
+            paged(l, at, xml.len(), 1024)
+        };
+        let no_run: &[u8] = &[];
+        let empty = packet(&[no_run; MAX_FIELDS]).repeat(4096);
+        let r = read_e57_cloud(&file(&empty, 0), 10).unwrap();
+        assert!(r.positions.is_empty());
+        let e = read_e57_cloud(&file(&empty, 1), 10).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("fewer values than points"), "{e}");
+        // Two points after them, over two packets with an empty packet between. y is cut inside its
+        // first value, z is all in the first packet and x all in the second.
+        let doubles = |v: [f64; 2]| v.iter().flat_map(|d| d.to_le_bytes()).collect::<Vec<u8>>();
+        let (x, y, z) = (doubles([1.0, -4.0]), doubles([2.0, 5.0]), doubles([3.0, 0.5]));
+        let mut first = vec![no_run; MAX_FIELDS];
+        let mut second = first.clone();
+        first[1] = &y[..3];
+        first[2] = &z[..];
+        second[0] = &x[..];
+        second[1] = &y[3..];
+        let packets = [empty, packet(&first), vec![2, 0, 3, 0], packet(&second), packet(&[no_run; MAX_FIELDS])].concat();
+        let r = read_e57_cloud(&file(&packets, 2), 10).unwrap();
+        assert!(near(&r.positions, &[[1.0, 2.0, 3.0], [-4.0, 5.0, 0.5]]), "{:?}", r.positions);
+        assert_eq!((r.vertices, r.skipped), (2, 0));
+    }
+
+    #[test]
+    fn skips_to_the_packets_that_hold_values_read_back_as_written() {
+        let distances = [0, 1, 127, 128, 16_383, 16_384, 2_129_920, u32::MAX as usize, usize::MAX];
+        let mut skips = Vec::new();
+        for n in distances {
+            push_skip(&mut skips, n);
+        }
+        // A distance under 128 takes one byte, and each 7 bits more take one more.
+        assert_eq!(skips[..6], [0, 1, 127, 0x80, 1, 0xff]);
+        let mut rest = skips.as_slice();
+        let read: Vec<usize> = std::iter::from_fn(|| next_skip(&mut rest)).collect();
+        assert_eq!(read, distances);
+        assert!(rest.is_empty());
+        // A last distance cut short is not read.
+        let mut cut: &[u8] = &skips[..skips.len() - 1];
+        assert_eq!(std::iter::from_fn(|| next_skip(&mut cut)).count(), distances.len() - 1);
     }
 
     #[test]
