@@ -146,7 +146,9 @@ fn sites_at(root: &Path, rev: &str, dir: &Path) -> Result<BTreeSet<String>, Stri
         .spawn()
         .map_err(|e| format!("git archive: {e}"))?;
     let stdout = archive.stdout.take().ok_or("git archive: no output")?;
-    let tar = Command::new("tar").arg("-x").arg("-C").arg(dir).stdin(stdout).status().map_err(|e| format!("tar: {e}"))?;
+    // `-f -` names standard input. Without it the tar that Windows ships (found before any
+    // other) opens the tape drive instead, so the base could never be read there.
+    let tar = Command::new("tar").args(["-x", "-f", "-", "-C"]).arg(dir).stdin(stdout).status().map_err(|e| format!("tar: {e}"))?;
     let archived = archive.wait().map_err(|e| format!("git archive: {e}"))?;
     if !archived.success() || !tar.success() {
         return Err(format!("cannot read the crates at {rev}"));
@@ -461,6 +463,17 @@ mod tests {
     fn the_list_is_sorted_with_a_reason_each() {
         assert!(grade("b.rs:near x\na.rs:tilt x\n", &found(&["a.rs:tilt", "b.rs:near"]), None).is_err());
         assert!(grade("a.rs:tilt\n", &found(&["a.rs:tilt"]), None).is_err());
+    }
+
+    /// The crates of a revision are read from git on every system. On Windows the gate once
+    /// never found its base, and judged each change by the list alone.
+    #[test]
+    fn the_crates_of_a_revision_are_read_from_git() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = std::env::temp_dir().join(format!("xtask-app-geometry-test-{}", std::process::id()));
+        let sites = sites_at(root, "HEAD", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!sites.unwrap().is_empty());
     }
 
     /// Judged against the base this tree started from (in a merge-queue group, the code it lands
